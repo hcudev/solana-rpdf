@@ -30,23 +30,70 @@ use std::{
     mem, ptr,
 };
 
-/// Return value of programs and syscalls
-pub type ProgramResult = Result<u64, EbpfError>;
-
-/// Error handling for SyscallObject::call methods
-#[macro_export]
-macro_rules! question_mark {
-    ( $value:expr, $result:ident ) => {{
-        let value = $value;
-        match value {
-            Err(err) => {
-                *$result = Err(err.into());
-                return;
-            }
-            Ok(value) => value,
-        }
-    }};
+/// Same as `Result` but provides a stable memory layout
+#[derive(Debug)]
+#[repr(C, u64)]
+pub enum StableResult<T, E> {
+    /// Success
+    Ok(T),
+    /// Failure
+    Err(E),
 }
+
+impl<T: Debug, E: Debug> StableResult<T, E> {
+    /// `true` if `Ok`
+    pub fn is_ok(&self) -> bool {
+        match self {
+            Self::Ok(_) => true,
+            Self::Err(_) => false,
+        }
+    }
+
+    /// `true` if `Err`
+    pub fn is_err(&self) -> bool {
+        match self {
+            Self::Ok(_) => false,
+            Self::Err(_) => true,
+        }
+    }
+
+    /// Returns the inner value if `Ok`, panics otherwise
+    pub fn unwrap(self) -> T {
+        match self {
+            Self::Ok(value) => value,
+            Self::Err(error) => panic!("unwrap {:?}", error),
+        }
+    }
+
+    /// Returns the inner error if `Err`, panics otherwise
+    pub fn unwrap_err(self) -> E {
+        match self {
+            Self::Ok(value) => panic!("unwrap_err {:?}", value),
+            Self::Err(error) => error,
+        }
+    }
+}
+
+impl<T, E> From<StableResult<T, E>> for Result<T, E> {
+    fn from(result: StableResult<T, E>) -> Self {
+        match result {
+            StableResult::Ok(value) => Ok(value),
+            StableResult::Err(value) => Err(value),
+        }
+    }
+}
+
+impl<T, E> From<Result<T, E>> for StableResult<T, E> {
+    fn from(result: Result<T, E>) -> Self {
+        match result {
+            Ok(value) => Self::Ok(value),
+            Err(value) => Self::Err(value),
+        }
+    }
+}
+
+/// Return value of programs and syscalls
+pub type ProgramResult = StableResult<u64, EbpfError>;
 
 /// Syscall initialization function
 pub type SyscallInit<'a, C> = fn(C) -> Box<(dyn SyscallObject + 'a)>;
@@ -667,7 +714,10 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
     pub fn execute_program_interpreted(&mut self, instruction_meter: &mut I) -> ProgramResult {
         let mut result = Ok(None);
         let (initial_insn_count, due_insn_count) = {
-            let mut interpreter = Interpreter::new(self, instruction_meter)?;
+            let mut interpreter = match Interpreter::new(self, instruction_meter) {
+                Ok(interpreter) => interpreter,
+                Err(error) => return ProgramResult::Err(error),
+            };
             while let Ok(None) = result {
                 result = interpreter.step();
             }
@@ -682,7 +732,11 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
             instruction_meter.consume(due_insn_count);
             self.total_insn_count = initial_insn_count - instruction_meter.get_remaining();
         }
-        Ok(result?.unwrap_or(0))
+        match result {
+            Ok(None) => unreachable!(),
+            Ok(Some(value)) => ProgramResult::Ok(value),
+            Err(error) => ProgramResult::Err(error),
+        }
     }
 
     /// Execute the previously JIT-compiled program, with the given packet data in a manner
@@ -701,10 +755,14 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
         } else {
             0
         };
-        let mut result: ProgramResult = Ok(0);
-        let compiled_program = executable
+        let mut result = ProgramResult::Ok(0);
+        let compiled_program = match executable
             .get_compiled_program()
-            .ok_or(EbpfError::JitNotCompiled)?;
+            .ok_or(EbpfError::JitNotCompiled)
+        {
+            Ok(compiled_program) => compiled_program,
+            Err(error) => return ProgramResult::Err(error),
+        };
         let instruction_meter_final = unsafe {
             (compiled_program.main)(
                 &mut result,
@@ -723,8 +781,8 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
             // self.total_insn_count = initial_insn_count - instruction_meter.get_remaining();
         }
         match result {
-            Err(EbpfError::ExceededMaxInstructions(pc, _)) => {
-                Err(EbpfError::ExceededMaxInstructions(pc, initial_insn_count))
+            ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, _)) => {
+                ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, initial_insn_count))
             }
             x => x,
         }
@@ -756,6 +814,14 @@ impl<'a> ProgramEnvironment<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_program_result_is_stable() {
+        let ok = ProgramResult::Ok(42);
+        assert_eq!(unsafe { *(&ok as *const _ as *const u64) }, 0);
+        let err = ProgramResult::Err(EbpfError::JitNotCompiled);
+        assert_eq!(unsafe { *(&err as *const _ as *const u64) }, 1);
+    }
 
     #[test]
     fn test_program_environment_offsets() {

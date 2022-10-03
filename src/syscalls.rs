@@ -22,10 +22,23 @@
 
 use crate::{
     memory_region::{AccessType, MemoryMapping},
-    question_mark,
     vm::{ProgramResult, SyscallObject},
 };
 use std::{slice::from_raw_parts, str::from_utf8};
+
+/// Error handling for SyscallObject::call methods
+macro_rules! question_mark {
+    ( $value:expr, $result:ident ) => {{
+        let value = $value;
+        match value {
+            ProgramResult::Err(err) => {
+                *$result = ProgramResult::Err(err.into());
+                return;
+            }
+            ProgramResult::Ok(value) => value,
+        }
+    }};
+}
 
 /// Test syscall context
 pub type BpfSyscallContext = u64;
@@ -49,7 +62,7 @@ pub const BPF_TRACE_PRINTK_IDX: u32 = 6;
 /// use solana_rbpf::memory_region::{MemoryRegion, MemoryMapping};
 /// use solana_rbpf::vm::{Config, SyscallObject, ProgramResult};
 ///
-/// let mut result: ProgramResult = Ok(0);
+/// let mut result = ProgramResult::Ok(0);
 /// let config = Config::default();
 /// let mut memory_mapping = MemoryMapping::new(vec![], &config).unwrap();
 /// BpfTracePrintf::call(&mut BpfTracePrintf {}, 0, 0, 1, 15, 32, &mut memory_mapping, &mut result);
@@ -123,7 +136,7 @@ impl SyscallObject for BpfTracePrintf {
 /// use solana_rbpf::memory_region::{MemoryRegion, MemoryMapping};
 /// use solana_rbpf::vm::{Config, SyscallObject, ProgramResult};
 ///
-/// let mut result: ProgramResult = Ok(0);
+/// let mut result = ProgramResult::Ok(0);
 /// let config = Config::default();
 /// let mut memory_mapping = MemoryMapping::new(vec![], &config).unwrap();
 /// BpfGatherBytes::call(&mut BpfGatherBytes {}, 0x11, 0x22, 0x33, 0x44, 0x55, &mut memory_mapping, &mut result);
@@ -171,7 +184,7 @@ impl SyscallObject for BpfGatherBytes {
 /// let mut val = &mut [0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33];
 /// let val_va = 0x100000000;
 ///
-/// let mut result: ProgramResult = Ok(0);
+/// let mut result = ProgramResult::Ok(0);
 /// let config = Config::default();
 /// let mut memory_mapping = MemoryMapping::new(vec![MemoryRegion::new_writable(val, val_va)], &config).unwrap();
 /// BpfMemFrob::call(&mut BpfMemFrob {}, val_va, 8, 0, 0, 0, &mut memory_mapping, &mut result);
@@ -222,12 +235,12 @@ impl SyscallObject for BpfMemFrob {
 /// let va_foo = 0x100000000;
 /// let va_bar = 0x200000000;
 ///
-/// let mut result: ProgramResult = Ok(0);
+/// let mut result = ProgramResult::Ok(0);
 /// let config = Config::default();
 /// let mut memory_mapping = MemoryMapping::new(vec![MemoryRegion::new_readonly(foo.as_bytes(), va_foo)], &config).unwrap();
 /// BpfStrCmp::call(&mut BpfStrCmp {}, va_foo, va_foo, 0, 0, 0, &mut memory_mapping, &mut result);
 /// assert!(result.unwrap() == 0);
-/// let mut result: ProgramResult = Ok(0);
+/// let mut result = ProgramResult::Ok(0);
 /// let mut memory_mapping = MemoryMapping::new(vec![MemoryRegion::new_readonly(foo.as_bytes(), va_foo), MemoryRegion::new_readonly(bar.as_bytes(), va_bar)], &config).unwrap();
 /// BpfStrCmp::call(&mut BpfStrCmp {}, va_foo, va_bar, 0, 0, 0, &mut memory_mapping, &mut result);
 /// assert!(result.unwrap() != 0);
@@ -267,9 +280,9 @@ impl SyscallObject for BpfStrCmp {
                 b_val = *(b as *const u8);
             }
             *result = if a_val >= b_val {
-                Result::Ok((a_val - b_val) as u64)
+                ProgramResult::Ok((a_val - b_val) as u64)
             } else {
-                Result::Ok((b_val - a_val) as u64)
+                ProgramResult::Ok((b_val - a_val) as u64)
             };
         }
     }
