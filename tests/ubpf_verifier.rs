@@ -27,9 +27,10 @@ use solana_rbpf::{
     ebpf,
     elf::Executable,
     verifier::{RequisiteVerifier, Verifier, VerifierError},
-    vm::{Config, EbpfVm, SyscallRegistry, TestInstructionMeter, VerifiedExecutable},
+    vm::{
+        Config, EbpfVm, FunctionRegistry, SyscallRegistry, TestInstructionMeter, VerifiedExecutable,
+    },
 };
-use std::collections::BTreeMap;
 use test_utils::TautologyVerifier;
 use thiserror::Error;
 
@@ -42,7 +43,11 @@ pub enum VerifierTestError {
 
 struct ContradictionVerifier {}
 impl Verifier for ContradictionVerifier {
-    fn verify(_prog: &[u8], _config: &Config) -> std::result::Result<(), VerifierError> {
+    fn verify(
+        _prog: &[u8],
+        _config: &Config,
+        _function_registry: &FunctionRegistry,
+    ) -> std::result::Result<(), VerifierError> {
         Err(VerifierError::NoProgram)
     }
 }
@@ -116,7 +121,7 @@ fn test_verifier_err_endian_size() {
         prog,
         Config::default(),
         SyscallRegistry::default(),
-        BTreeMap::default(),
+        FunctionRegistry::default(),
     )
     .unwrap();
     let _verified_executable =
@@ -136,7 +141,7 @@ fn test_verifier_err_incomplete_lddw() {
         prog,
         Config::default(),
         SyscallRegistry::default(),
-        BTreeMap::default(),
+        FunctionRegistry::default(),
     )
     .unwrap();
     let _verified_executable =
@@ -282,7 +287,7 @@ fn test_verifier_err_unknown_opcode() {
         prog,
         Config::default(),
         SyscallRegistry::default(),
-        BTreeMap::default(),
+        FunctionRegistry::default(),
     )
     .unwrap();
     let _verified_executable =

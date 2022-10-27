@@ -1,7 +1,5 @@
 #![no_main]
 
-use std::collections::BTreeMap;
-
 use libfuzzer_sys::fuzz_target;
 
 use grammar_aware::*;
@@ -11,7 +9,7 @@ use solana_rbpf::{
     insn_builder::{Arch, Instruction, IntoBytes},
     memory_region::MemoryRegion,
     verifier::{RequisiteVerifier, Verifier},
-    vm::{EbpfVm, SyscallRegistry, TestInstructionMeter, VerifiedExecutable},
+    vm::{EbpfVm, SyscallRegistry, FunctionRegistry, TestInstructionMeter, VerifiedExecutable},
 };
 use test_utils::TautologyVerifier;
 
@@ -40,7 +38,8 @@ fuzz_target!(|data: FuzzData| {
         .set_imm(data.exit_imm)
         .push();
     let config = data.template.into();
-    if RequisiteVerifier::verify(prog.into_bytes(), &config).is_err() {
+    let function_registry = FunctionRegistry::default();
+    if RequisiteVerifier::verify(prog.into_bytes(), &config, &function_registry).is_err() {
         // verify please
         return;
     }
@@ -50,7 +49,7 @@ fuzz_target!(|data: FuzzData| {
         prog.into_bytes(),
         config,
         SyscallRegistry::default(),
-        BTreeMap::new(),
+        function_registry,
     )
     .unwrap();
     let mut verified_executable =

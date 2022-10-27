@@ -1,6 +1,5 @@
 #![no_main]
 
-use std::collections::BTreeMap;
 use std::hint::black_box;
 
 use libfuzzer_sys::fuzz_target;
@@ -10,7 +9,7 @@ use solana_rbpf::{
     elf::Executable,
     memory_region::MemoryRegion,
     verifier::{RequisiteVerifier, Verifier},
-    vm::{EbpfVm, SyscallRegistry, TestInstructionMeter, VerifiedExecutable},
+    vm::{EbpfVm, SyscallRegistry, FunctionRegistry, TestInstructionMeter, VerifiedExecutable},
 };
 use test_utils::TautologyVerifier;
 
@@ -28,7 +27,8 @@ struct DumbFuzzData {
 fuzz_target!(|data: DumbFuzzData| {
     let prog = data.prog;
     let config = data.template.into();
-    if RequisiteVerifier::verify(&prog, &config).is_err() {
+    let function_registry = FunctionRegistry::default();
+    if RequisiteVerifier::verify(&prog, &config, &function_registry).is_err() {
         // verify please
         return;
     }
@@ -37,7 +37,7 @@ fuzz_target!(|data: DumbFuzzData| {
         &prog,
         config,
         SyscallRegistry::default(),
-        BTreeMap::new(),
+        function_registry,
     )
     .unwrap();
     let verified_executable =
