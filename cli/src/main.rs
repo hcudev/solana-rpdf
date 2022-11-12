@@ -7,9 +7,7 @@ use solana_rbpf::{
     memory_region::MemoryRegion,
     static_analysis::Analysis,
     verifier::RequisiteVerifier,
-    vm::{
-        Config, DynamicAnalysis, EbpfVm, SyscallRegistry, TestInstructionMeter, VerifiedExecutable,
-    },
+    vm::{Config, DynamicAnalysis, EbpfVm, SyscallRegistry, TestContextObject, VerifiedExecutable},
 };
 use std::{fs::File, io::Read, path::Path};
 
@@ -105,7 +103,7 @@ fn main() {
             let mut file = File::open(Path::new(asm_file_name)).unwrap();
             let mut source = Vec::new();
             file.read_to_end(&mut source).unwrap();
-            assemble::<TestInstructionMeter>(
+            assemble::<TestContextObject>(
                 std::str::from_utf8(source.as_slice()).unwrap(),
                 config,
                 syscall_registry,
@@ -115,14 +113,14 @@ fn main() {
             let mut file = File::open(Path::new(matches.value_of("elf").unwrap())).unwrap();
             let mut elf = Vec::new();
             file.read_to_end(&mut elf).unwrap();
-            Executable::<TestInstructionMeter>::from_elf(&elf, config, syscall_registry)
+            Executable::<TestContextObject>::from_elf(&elf, config, syscall_registry)
                 .map_err(|err| format!("Executable constructor failed: {:?}", err))
         }
     }
     .unwrap();
 
     let mut verified_executable =
-        VerifiedExecutable::<RequisiteVerifier, TestInstructionMeter>::from_executable(executable)
+        VerifiedExecutable::<RequisiteVerifier, TestContextObject>::from_executable(executable)
             .unwrap();
 
     let mut mem = match matches.value_of("input").unwrap().parse::<usize>() {
@@ -133,13 +131,6 @@ fn main() {
             file.read_to_end(&mut memory).unwrap();
             memory
         }
-    };
-    let mut instruction_meter = TestInstructionMeter {
-        remaining: matches
-            .value_of("instruction limit")
-            .unwrap()
-            .parse::<u64>()
-            .unwrap(),
     };
     let mut heap = vec![
         0_u8;
@@ -153,7 +144,20 @@ fn main() {
         verified_executable.jit_compile().unwrap();
     }
     let mem_region = MemoryRegion::new_writable(&mut mem, ebpf::MM_INPUT_START);
-    let mut vm = EbpfVm::new(&verified_executable, &mut (), &mut heap, vec![mem_region]).unwrap();
+    let mut context_object = TestContextObject {
+        remaining: matches
+            .value_of("instruction limit")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap(),
+    };
+    let mut vm = EbpfVm::new(
+        &verified_executable,
+        &mut context_object,
+        &mut heap,
+        vec![mem_region],
+    )
+    .unwrap();
 
     let analysis = if matches.value_of("use") == Some("cfg")
         || matches.value_of("use") == Some("disassembler")
@@ -187,26 +191,26 @@ fn main() {
     }
 
     let result = if matches.value_of("use").unwrap() == "debugger" {
-        let mut interpreter = Interpreter::new(&mut vm, &mut instruction_meter).unwrap();
+        let mut interpreter = Interpreter::new(&mut vm).unwrap();
         let port = matches.value_of("port").unwrap().parse::<u16>().unwrap();
         debugger::execute(&mut interpreter, port)
     } else if matches.value_of("use").unwrap() == "interpreter" {
-        vm.execute_program_interpreted(&mut instruction_meter)
+        vm.execute_program_interpreted()
     } else {
-        vm.execute_program_jit(&mut instruction_meter)
+        vm.execute_program_jit()
     };
     println!("Result: {:?}", result);
     println!("Instruction Count: {}", vm.get_total_instruction_count());
     if matches.is_present("trace") {
         println!("Trace:\n");
         let stdout = std::io::stdout();
-        vm.get_program_environment()
+        vm.program_environment
             .tracer
             .write(&mut stdout.lock(), analysis.as_ref().unwrap())
             .unwrap();
     }
     if matches.is_present("profile") {
-        let tracer = &vm.get_program_environment().tracer;
+        let tracer = &vm.program_environment.tracer;
         let dynamic_analysis = DynamicAnalysis::new(tracer, analysis.as_ref().unwrap());
         let mut file = File::create("profile.dot").unwrap();
         analysis

@@ -246,7 +246,7 @@ impl Default for Config {
 }
 
 /// Static constructors for Executable
-impl<I: 'static + InstructionMeter> Executable<I> {
+impl<C: 'static + ContextObject> Executable<C> {
     /// Creates an executable from an ELF file
     pub fn from_elf(
         elf_bytes: &[u8],
@@ -271,14 +271,14 @@ impl<I: 'static + InstructionMeter> Executable<I> {
 /// Verified executable
 #[derive(Debug, PartialEq)]
 #[repr(transparent)]
-pub struct VerifiedExecutable<V: Verifier, I: InstructionMeter> {
-    executable: Executable<I>,
+pub struct VerifiedExecutable<V: Verifier, C: ContextObject> {
+    executable: Executable<C>,
     _verifier: PhantomData<V>,
 }
 
-impl<V: Verifier, I: InstructionMeter> VerifiedExecutable<V, I> {
+impl<V: Verifier, C: ContextObject> VerifiedExecutable<V, C> {
     /// Verify an executable
-    pub fn from_executable(executable: Executable<I>) -> Result<Self, EbpfError> {
+    pub fn from_executable(executable: Executable<C>) -> Result<Self, EbpfError> {
         <V as Verifier>::verify(
             executable.get_text_bytes().1,
             executable.get_config(),
@@ -293,17 +293,17 @@ impl<V: Verifier, I: InstructionMeter> VerifiedExecutable<V, I> {
     /// JIT compile the executable
     #[cfg(feature = "jit")]
     pub fn jit_compile(&mut self) -> Result<(), EbpfError> {
-        Executable::<I>::jit_compile(&mut self.executable)
+        Executable::<C>::jit_compile(&mut self.executable)
     }
 
     /// Get a reference to the underlying executable
-    pub fn get_executable(&self) -> &Executable<I> {
+    pub fn get_executable(&self) -> &Executable<C> {
         &self.executable
     }
 }
 
 /// Instruction meter
-pub trait InstructionMeter {
+pub trait ContextObject {
     /// Consume instructions
     fn consume(&mut self, amount: u64);
     /// Get the number of remaining instructions allowed
@@ -311,13 +311,13 @@ pub trait InstructionMeter {
 }
 
 /// Simple instruction meter for testing
-#[derive(Debug, PartialEq, Eq)]
-pub struct TestInstructionMeter {
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TestContextObject {
     /// Maximal amount of instructions which still can be executed
     pub remaining: u64,
 }
 
-impl InstructionMeter for TestInstructionMeter {
+impl ContextObject for TestContextObject {
     fn consume(&mut self, amount: u64) {
         debug_assert!(amount <= self.remaining, "Execution count exceeded");
         self.remaining = self.remaining.saturating_sub(amount);
@@ -338,7 +338,7 @@ pub struct DynamicAnalysis {
 
 impl DynamicAnalysis {
     /// Accumulates a trace
-    pub fn new<I: InstructionMeter>(tracer: &Tracer, analysis: &Analysis<I>) -> Self {
+    pub fn new<C: ContextObject>(tracer: &Tracer, analysis: &Analysis<C>) -> Self {
         let mut result = Self {
             edge_counter_max: 0,
             edges: BTreeMap::new(),
@@ -376,10 +376,10 @@ impl Tracer {
     }
 
     /// Use this method to print the log of this tracer
-    pub fn write<W: std::io::Write, I: InstructionMeter>(
+    pub fn write<W: std::io::Write, C: ContextObject>(
         &self,
         output: &mut W,
-        analysis: &Analysis<I>,
+        analysis: &Analysis<C>,
     ) -> Result<(), std::io::Error> {
         let mut pc_to_insn_index = vec![
             0usize;
@@ -427,7 +427,7 @@ impl Tracer {
 /// # Examples
 ///
 /// ```
-/// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, memory_region::MemoryRegion, vm::{Config, EbpfVm, TestInstructionMeter, FunctionRegistry, SyscallRegistry, VerifiedExecutable}, verifier::RequisiteVerifier};
+/// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, memory_region::MemoryRegion, vm::{Config, EbpfVm, TestContextObject, FunctionRegistry, SyscallRegistry, VerifiedExecutable}, verifier::RequisiteVerifier};
 ///
 /// let prog = &[
 ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
@@ -440,32 +440,34 @@ impl Tracer {
 /// let config = Config::default();
 /// let syscall_registry = SyscallRegistry::default();
 /// let function_registry = FunctionRegistry::default();
-/// let mut executable = Executable::<TestInstructionMeter>::from_text_bytes(prog, config, syscall_registry, function_registry).unwrap();
+/// let mut executable = Executable::<TestContextObject>::from_text_bytes(prog, config, syscall_registry, function_registry).unwrap();
 /// let mem_region = MemoryRegion::new_writable(mem, ebpf::MM_INPUT_START);
-/// let verified_executable = VerifiedExecutable::<RequisiteVerifier, TestInstructionMeter>::from_executable(executable).unwrap();
-/// let mut vm = EbpfVm::new(&verified_executable, &mut (), &mut [], vec![mem_region]).unwrap();
+/// let verified_executable = VerifiedExecutable::<RequisiteVerifier, TestContextObject>::from_executable(executable).unwrap();
+/// let mut context_object = TestContextObject { remaining: 1 };
+/// let mut vm = EbpfVm::new(&verified_executable, &mut context_object, &mut [], vec![mem_region]).unwrap();
 ///
 /// // Provide a reference to the packet data.
-/// let res = vm.execute_program_interpreted(&mut TestInstructionMeter { remaining: 1 }).unwrap();
+/// let res = vm.execute_program_interpreted().unwrap();
 /// assert_eq!(res, 0);
 /// ```
-pub struct EbpfVm<'a, V: Verifier, I: InstructionMeter> {
-    pub(crate) verified_executable: &'a VerifiedExecutable<V, I>,
+pub struct EbpfVm<'a, V: Verifier, C: ContextObject> {
+    pub(crate) verified_executable: &'a VerifiedExecutable<V, C>,
     pub(crate) program: &'a [u8],
     pub(crate) program_vm_addr: u64,
-    pub(crate) program_environment: ProgramEnvironment<'a>,
+    /// MemoryMapping, ContextObject and Tracer
+    pub program_environment: ProgramEnvironment<'a, C>,
     pub(crate) stack: CallFrames<'a>,
     pub(crate) total_insn_count: u64,
 }
 
-impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
+impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
     /// Create a new virtual machine instance, and load an eBPF program into that instance.
     /// When attempting to load the program, it passes through a simple verifier.
     ///
     /// # Examples
     ///
     /// ```
-    /// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, vm::{Config, EbpfVm, TestInstructionMeter, FunctionRegistry, SyscallRegistry, VerifiedExecutable}, verifier::RequisiteVerifier};
+    /// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, vm::{Config, EbpfVm, TestContextObject, FunctionRegistry, SyscallRegistry, VerifiedExecutable}, verifier::RequisiteVerifier};
     ///
     /// let prog = &[
     ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
@@ -475,16 +477,16 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
     /// let config = Config::default();
     /// let syscall_registry = SyscallRegistry::default();
     /// let function_registry = FunctionRegistry::default();
-    /// let mut executable = Executable::<TestInstructionMeter>::from_text_bytes(prog, config, syscall_registry, function_registry).unwrap();
-    /// let verified_executable = VerifiedExecutable::<RequisiteVerifier, TestInstructionMeter>::from_executable(executable).unwrap();
-    /// let mut vm = EbpfVm::new(&verified_executable, &mut (), &mut [], Vec::new()).unwrap();
+    /// let mut executable = Executable::<TestContextObject>::from_text_bytes(prog, config, syscall_registry, function_registry).unwrap();
+    /// let verified_executable = VerifiedExecutable::<RequisiteVerifier, TestContextObject>::from_executable(executable).unwrap();
+    /// let mut vm = EbpfVm::new(&verified_executable, &mut TestContextObject::default(), &mut [], Vec::new()).unwrap();
     /// ```
-    pub fn new<O>(
-        verified_executable: &'a VerifiedExecutable<V, I>,
-        syscall_context_object: &mut O,
+    pub fn new(
+        verified_executable: &'a VerifiedExecutable<V, C>,
+        context_object: &'a mut C,
         heap_region: &mut [u8],
         additional_regions: Vec<MemoryRegion>,
-    ) -> Result<EbpfVm<'a, V, I>, EbpfError> {
+    ) -> Result<EbpfVm<'a, V, C>, EbpfError> {
         let executable = verified_executable.get_executable();
         let config = executable.get_config();
         let mut stack = CallFrames::new(config);
@@ -503,7 +505,7 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
             program_vm_addr,
             program_environment: ProgramEnvironment {
                 memory_mapping: MemoryMapping::new(regions, config)?,
-                syscall_context_object: syscall_context_object as *mut O as *mut (),
+                context_object,
                 tracer: Tracer::default(),
             },
             stack,
@@ -523,11 +525,6 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
         self.program
     }
 
-    /// Returns the tracer
-    pub fn get_program_environment(&self) -> &ProgramEnvironment {
-        &self.program_environment
-    }
-
     /// Execute the program loaded, with the given packet data.
     ///
     /// Warning: The program is executed without limiting the number of
@@ -536,7 +533,7 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
     /// # Examples
     ///
     /// ```
-    /// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, memory_region::MemoryRegion, vm::{Config, EbpfVm, TestInstructionMeter, FunctionRegistry, SyscallRegistry, VerifiedExecutable}, verifier::RequisiteVerifier};
+    /// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, memory_region::MemoryRegion, vm::{Config, EbpfVm, TestContextObject, FunctionRegistry, SyscallRegistry, VerifiedExecutable}, verifier::RequisiteVerifier};
     ///
     /// let prog = &[
     ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
@@ -549,19 +546,20 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
     /// let config = Config::default();
     /// let syscall_registry = SyscallRegistry::default();
     /// let function_registry = FunctionRegistry::default();
-    /// let mut executable = Executable::<TestInstructionMeter>::from_text_bytes(prog, config, syscall_registry, function_registry).unwrap();
-    /// let verified_executable = VerifiedExecutable::<RequisiteVerifier, TestInstructionMeter>::from_executable(executable).unwrap();
+    /// let mut executable = Executable::<TestContextObject>::from_text_bytes(prog, config, syscall_registry, function_registry).unwrap();
+    /// let verified_executable = VerifiedExecutable::<RequisiteVerifier, TestContextObject>::from_executable(executable).unwrap();
     /// let mem_region = MemoryRegion::new_writable(mem, ebpf::MM_INPUT_START);
-    /// let mut vm = EbpfVm::new(&verified_executable, &mut (), &mut [], vec![mem_region]).unwrap();
+    /// let mut context_object = TestContextObject { remaining: 1 };
+    /// let mut vm = EbpfVm::new(&verified_executable, &mut context_object, &mut [], vec![mem_region]).unwrap();
     ///
     /// // Provide a reference to the packet data.
-    /// let res = vm.execute_program_interpreted(&mut TestInstructionMeter { remaining: 1 }).unwrap();
+    /// let res = vm.execute_program_interpreted().unwrap();
     /// assert_eq!(res, 0);
     /// ```
-    pub fn execute_program_interpreted(&mut self, instruction_meter: &mut I) -> ProgramResult {
+    pub fn execute_program_interpreted(&mut self) -> ProgramResult {
         let mut result = Ok(None);
         let (initial_insn_count, due_insn_count) = {
-            let mut interpreter = match Interpreter::new(self, instruction_meter) {
+            let mut interpreter = match Interpreter::new(self) {
                 Ok(interpreter) => interpreter,
                 Err(error) => return ProgramResult::Err(error),
             };
@@ -576,8 +574,11 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
             .get_config()
             .enable_instruction_meter
         {
-            instruction_meter.consume(due_insn_count);
-            self.total_insn_count = initial_insn_count - instruction_meter.get_remaining();
+            self.program_environment
+                .context_object
+                .consume(due_insn_count);
+            self.total_insn_count =
+                initial_insn_count - self.program_environment.context_object.get_remaining();
         }
         match result {
             Ok(None) => unreachable!(),
@@ -595,10 +596,10 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
     /// the program works with the interpreter before running the JIT-compiled version of it.
     ///
     #[cfg(feature = "jit")]
-    pub fn execute_program_jit(&mut self, instruction_meter: &mut I) -> ProgramResult {
+    pub fn execute_program_jit(&mut self) -> ProgramResult {
         let executable = self.verified_executable.get_executable();
         let initial_insn_count = if executable.get_config().enable_instruction_meter {
-            instruction_meter.get_remaining()
+            self.program_environment.context_object.get_remaining()
         } else {
             0
         };
@@ -611,21 +612,18 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
             Err(error) => return ProgramResult::Err(error),
         };
         let instruction_meter_final = unsafe {
-            (compiled_program.main)(
-                &mut result,
-                ebpf::MM_INPUT_START,
-                &self.program_environment,
-                instruction_meter,
-            )
-            .max(0) as u64
+            (compiled_program.main)(&mut result, ebpf::MM_INPUT_START, &self.program_environment)
+                .max(0) as u64
         };
         if executable.get_config().enable_instruction_meter {
-            let remaining_insn_count = instruction_meter.get_remaining();
+            let remaining_insn_count = self.program_environment.context_object.get_remaining();
             let due_insn_count = remaining_insn_count - instruction_meter_final;
-            instruction_meter.consume(due_insn_count);
+            self.program_environment
+                .context_object
+                .consume(due_insn_count);
             self.total_insn_count = initial_insn_count + due_insn_count - remaining_insn_count;
             // Same as:
-            // self.total_insn_count = initial_insn_count - instruction_meter.get_remaining();
+            // self.total_insn_count = initial_insn_count - self.program_environment.context_object.get_remaining();
         }
         match result {
             ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, _)) => {
@@ -638,23 +636,22 @@ impl<'a, V: Verifier, I: InstructionMeter> EbpfVm<'a, V, I> {
 
 /// The execution environment of a program instance.
 #[repr(C)]
-pub struct ProgramEnvironment<'a> {
+pub struct ProgramEnvironment<'a, C: ContextObject> {
     /// The MemoryMapping describing the address space of the program
     pub memory_mapping: MemoryMapping<'a>,
     /// Pointer to the context object of syscalls
-    pub syscall_context_object: *mut (),
+    pub context_object: &'a mut C,
     /// The instruction tracer
     pub tracer: Tracer,
 }
 
-impl<'a> ProgramEnvironment<'a> {
+impl<'a, C: ContextObject + 'a> ProgramEnvironment<'a, C> {
     /// Offset to Self::memory_mapping
     pub const MEMORY_MAPPING_OFFSET: usize = 0;
     /// Offset of Self::syscalls
-    pub const SYSCALL_CONTEXT_OBJECT: usize =
-        Self::MEMORY_MAPPING_OFFSET + mem::size_of::<MemoryMapping>();
+    pub const CONTEXT_OBJECT: usize = Self::MEMORY_MAPPING_OFFSET + mem::size_of::<MemoryMapping>();
     /// Offset of Self::tracer
-    pub const TRACER_OFFSET: usize = Self::SYSCALL_CONTEXT_OBJECT + mem::size_of::<*mut ()>();
+    pub const TRACER_OFFSET: usize = Self::CONTEXT_OBJECT + mem::size_of::<*mut ()>();
 }
 
 #[cfg(test)]
@@ -672,9 +669,9 @@ mod tests {
     #[test]
     fn test_program_environment_offsets() {
         let config = Config::default();
-        let env = ProgramEnvironment {
+        let env = ProgramEnvironment::<TestContextObject> {
             memory_mapping: MemoryMapping::new(vec![], &config).unwrap(),
-            syscall_context_object: std::ptr::null_mut(),
+            context_object: &mut TestContextObject::default(),
             tracer: Tracer::default(),
         };
         assert_eq!(
@@ -682,20 +679,20 @@ mod tests {
                 (&env.memory_mapping as *const _ as *const u8)
                     .offset_from(&env as *const _ as *const _)
             },
-            ProgramEnvironment::MEMORY_MAPPING_OFFSET as isize
+            ProgramEnvironment::<TestContextObject>::MEMORY_MAPPING_OFFSET as isize
         );
         assert_eq!(
             unsafe {
-                (&env.syscall_context_object as *const _ as *const u8)
+                (&env.context_object as *const _ as *const u8)
                     .offset_from(&env as *const _ as *const _)
             },
-            ProgramEnvironment::SYSCALL_CONTEXT_OBJECT as isize
+            ProgramEnvironment::<TestContextObject>::CONTEXT_OBJECT as isize
         );
         assert_eq!(
             unsafe {
                 (&env.tracer as *const _ as *const u8).offset_from(&env as *const _ as *const _)
             },
-            ProgramEnvironment::TRACER_OFFSET as isize
+            ProgramEnvironment::<TestContextObject>::TRACER_OFFSET as isize
         );
     }
 }

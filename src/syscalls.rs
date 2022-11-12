@@ -23,7 +23,7 @@
 
 use crate::{
     memory_region::{AccessType, MemoryMapping},
-    vm::ProgramResult,
+    vm::{ContextObject, ProgramResult},
 };
 use std::{slice::from_raw_parts, str::from_utf8};
 
@@ -323,8 +323,20 @@ impl BpfSyscallU64 {
 
 /// Example of a syscall with internal state.
 pub struct SyscallWithContext {
+    /// Maximal amount of instructions which still can be executed
+    pub remaining: u64,
     /// Mutable state
     pub context: u64,
+}
+impl ContextObject for SyscallWithContext {
+    fn consume(&mut self, amount: u64) {
+        debug_assert!(amount <= self.remaining, "Execution count exceeded");
+        self.remaining = self.remaining.saturating_sub(amount);
+    }
+
+    fn get_remaining(&self) -> u64 {
+        self.remaining
+    }
 }
 impl SyscallWithContext {
     /// Syscall handler method

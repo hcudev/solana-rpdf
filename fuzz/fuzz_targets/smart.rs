@@ -11,7 +11,7 @@ use solana_rbpf::{
     insn_builder::{Arch, IntoBytes},
     memory_region::MemoryRegion,
     verifier::{RequisiteVerifier, Verifier},
-    vm::{EbpfVm, SyscallRegistry, FunctionRegistry, TestInstructionMeter, VerifiedExecutable},
+    vm::{EbpfVm, SyscallRegistry, FunctionRegistry, TestContextObject, VerifiedExecutable},
 };
 use test_utils::TautologyVerifier;
 
@@ -37,7 +37,7 @@ fuzz_target!(|data: FuzzData| {
         return;
     }
     let mut mem = data.mem;
-    let executable = Executable::<TestInstructionMeter>::from_text_bytes(
+    let executable = Executable::<TestContextObject>::from_text_bytes(
         prog.into_bytes(),
         config,
         SyscallRegistry::default(),
@@ -45,12 +45,11 @@ fuzz_target!(|data: FuzzData| {
     )
     .unwrap();
     let verified_executable =
-        VerifiedExecutable::<TautologyVerifier, TestInstructionMeter>::from_executable(executable)
+        VerifiedExecutable::<TautologyVerifier, TestContextObject>::from_executable(executable)
             .unwrap();
     let mem_region = MemoryRegion::new_writable(&mut mem, ebpf::MM_INPUT_START);
-    let mut vm = EbpfVm::new(&verified_executable, &mut (), &mut [], vec![mem_region]).unwrap();
+    let mut context_object = TestContextObject { remaining: 1 << 16 };
+    let mut vm = EbpfVm::new(&verified_executable, &mut context_object, &mut [], vec![mem_region]).unwrap();
 
-    drop(black_box(vm.execute_program_interpreted(
-        &mut TestInstructionMeter { remaining: 1 << 16 },
-    )));
+    drop(black_box(vm.execute_program_interpreted()));
 });

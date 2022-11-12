@@ -18,7 +18,7 @@ use crate::{
     error::EbpfError,
     memory_region::AccessType,
     verifier::Verifier,
-    vm::{EbpfVm, InstructionMeter, ProgramResult},
+    vm::{ContextObject, EbpfVm, ProgramResult},
 };
 
 /// Translates a vm_addr into a host_addr and sets the pc in the error if one occurs
@@ -76,10 +76,8 @@ pub enum DebugState {
 }
 
 /// State of an interpreter
-pub struct Interpreter<'a, 'b, V: Verifier, I: InstructionMeter> {
-    pub(crate) vm: &'a mut EbpfVm<'b, V, I>,
-
-    pub(crate) instruction_meter: &'a mut I,
+pub struct Interpreter<'a, 'b, V: Verifier, C: ContextObject> {
+    pub(crate) vm: &'a mut EbpfVm<'b, V, C>,
 
     pub(crate) initial_insn_count: u64,
     remaining_insn_count: u64,
@@ -96,15 +94,12 @@ pub struct Interpreter<'a, 'b, V: Verifier, I: InstructionMeter> {
     pub(crate) breakpoints: Vec<u64>,
 }
 
-impl<'a, 'b, V: Verifier, I: InstructionMeter> Interpreter<'a, 'b, V, I> {
+impl<'a, 'b, V: Verifier, C: ContextObject> Interpreter<'a, 'b, V, C> {
     /// Creates a new interpreter state
-    pub fn new(
-        vm: &'a mut EbpfVm<'b, V, I>,
-        instruction_meter: &'a mut I,
-    ) -> Result<Self, EbpfError> {
+    pub fn new(vm: &'a mut EbpfVm<'b, V, C>) -> Result<Self, EbpfError> {
         let executable = vm.verified_executable.get_executable();
         let initial_insn_count = if executable.get_config().enable_instruction_meter {
-            instruction_meter.get_remaining()
+            vm.program_environment.context_object.get_remaining()
         } else {
             0
         };
@@ -125,7 +120,6 @@ impl<'a, 'b, V: Verifier, I: InstructionMeter> Interpreter<'a, 'b, V, I> {
         let pc = executable.get_entrypoint_instruction_offset();
         Ok(Self {
             vm,
-            instruction_meter,
             initial_insn_count,
             remaining_insn_count: initial_insn_count,
             due_insn_count: 0,
@@ -458,12 +452,12 @@ impl<'a, 'b, V: Verifier, I: InstructionMeter> Interpreter<'a, 'b, V, I> {
                         resolved = true;
 
                         if config.enable_instruction_meter {
-                            self.instruction_meter.consume(self.due_insn_count);
+                            self.vm.program_environment.context_object.consume(self.due_insn_count);
                         }
                         self.due_insn_count = 0;
                         let mut result = ProgramResult::Ok(0);
                         syscall(
-                            self.vm.program_environment.syscall_context_object,
+                            self.vm.program_environment.context_object as *mut _ as *mut (),
                             self.reg[1],
                             self.reg[2],
                             self.reg[3],
@@ -477,7 +471,7 @@ impl<'a, 'b, V: Verifier, I: InstructionMeter> Interpreter<'a, 'b, V, I> {
                             ProgramResult::Err(err) => return Err(err),
                         };
                         if config.enable_instruction_meter {
-                            self.remaining_insn_count = self.instruction_meter.get_remaining();
+                            self.remaining_insn_count = self.vm.program_environment.context_object.get_remaining();
                         }
                     }
                 }
