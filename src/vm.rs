@@ -454,7 +454,7 @@ impl DynamicAnalysis {
 /// # Examples
 ///
 /// ```
-/// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, memory_region::MemoryRegion, vm::{Config, EbpfVm, TestContextObject, FunctionRegistry, SyscallRegistry, VerifiedExecutable}, verifier::RequisiteVerifier};
+/// use solana_rbpf::{ebpf, elf::Executable, memory_region::MemoryRegion, vm::{Config, EbpfVm, TestContextObject, FunctionRegistry, SyscallRegistry, VerifiedExecutable}, verifier::RequisiteVerifier};
 ///
 /// let prog = &[
 ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
@@ -463,7 +463,6 @@ impl DynamicAnalysis {
 ///     0xaa, 0xbb, 0x11, 0x22, 0xcc, 0xdd
 /// ];
 ///
-/// // Instantiate a VM.
 /// let config = Config::default();
 /// let syscall_registry = SyscallRegistry::default();
 /// let function_registry = FunctionRegistry::default();
@@ -473,8 +472,7 @@ impl DynamicAnalysis {
 /// let mut context_object = TestContextObject::new(1);
 /// let mut vm = EbpfVm::new(&verified_executable, &mut context_object, &mut [], vec![mem_region]).unwrap();
 ///
-/// // Provide a reference to the packet data.
-/// let (instruction_count, result) = vm.execute_program_interpreted();
+/// let (instruction_count, result) = vm.execute_program(true);
 /// assert_eq!(instruction_count, 1);
 /// assert_eq!(result.unwrap(), 0);
 /// ```
@@ -490,26 +488,7 @@ pub struct EbpfVm<'a, V: Verifier, C: ContextObject> {
 }
 
 impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
-    /// Create a new virtual machine instance, and load an eBPF program into that instance.
-    /// When attempting to load the program, it passes through a simple verifier.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, vm::{Config, EbpfVm, TestContextObject, FunctionRegistry, SyscallRegistry, VerifiedExecutable}, verifier::RequisiteVerifier};
-    ///
-    /// let prog = &[
-    ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
-    /// ];
-    ///
-    /// // Instantiate a VM.
-    /// let config = Config::default();
-    /// let syscall_registry = SyscallRegistry::default();
-    /// let function_registry = FunctionRegistry::default();
-    /// let mut executable = Executable::<TestContextObject>::from_text_bytes(prog, config, syscall_registry, function_registry).unwrap();
-    /// let verified_executable = VerifiedExecutable::<RequisiteVerifier, TestContextObject>::from_executable(executable).unwrap();
-    /// let mut vm = EbpfVm::new(&verified_executable, &mut TestContextObject::default(), &mut [], Vec::new()).unwrap();
-    /// ```
+    /// Create a new virtual machine instance
     pub fn new(
         verified_executable: &'a VerifiedExecutable<V, C>,
         context_object: &'a mut C,
@@ -545,41 +524,18 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
         self.program
     }
 
-    /// Execute the program loaded, with the given packet data.
+    /// Execute the program
     ///
-    /// Warning: The program is executed without limiting the number of
-    /// instructions that can be executed
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use solana_rbpf::{ebpf, elf::{Executable, register_bpf_function}, memory_region::MemoryRegion, vm::{Config, EbpfVm, TestContextObject, FunctionRegistry, SyscallRegistry, VerifiedExecutable}, verifier::RequisiteVerifier};
-    ///
-    /// let prog = &[
-    ///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
-    /// ];
-    /// let mem = &mut [
-    ///     0xaa, 0xbb, 0x11, 0x22, 0xcc, 0xdd
-    /// ];
-    ///
-    /// // Instantiate a VM.
-    /// let config = Config::default();
-    /// let syscall_registry = SyscallRegistry::default();
-    /// let function_registry = FunctionRegistry::default();
-    /// let mut executable = Executable::<TestContextObject>::from_text_bytes(prog, config, syscall_registry, function_registry).unwrap();
-    /// let verified_executable = VerifiedExecutable::<RequisiteVerifier, TestContextObject>::from_executable(executable).unwrap();
-    /// let mem_region = MemoryRegion::new_writable(mem, ebpf::MM_INPUT_START);
-    /// let mut context_object = TestContextObject::new(1);
-    /// let mut vm = EbpfVm::new(&verified_executable, &mut context_object, &mut [], vec![mem_region]).unwrap();
-    ///
-    /// // Provide a reference to the packet data.
-    /// let (instruction_count, result) = vm.execute_program_interpreted();
-    /// assert_eq!(instruction_count, 1);
-    /// assert_eq!(result.unwrap(), 0);
-    /// ```
-    pub fn execute_program_interpreted(&mut self) -> (u64, ProgramResult) {
-        let mut result = Ok(None);
-        let (initial_insn_count, due_insn_count) = {
+    /// If interpreted = `false` then the JIT compiled executable is used.
+    pub fn execute_program(&mut self, interpreted: bool) -> (u64, ProgramResult) {
+        let executable = self.verified_executable.get_executable();
+        let initial_insn_count = if executable.get_config().enable_instruction_meter {
+            self.context_object.get_remaining()
+        } else {
+            0
+        };
+        let (due_insn_count, result) = if interpreted {
+            let mut result = Ok(None);
             let mut interpreter = match Interpreter::new(self) {
                 Ok(interpreter) => interpreter,
                 Err(error) => return (0, ProgramResult::Err(error)),
@@ -587,73 +543,58 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
             while let Ok(None) = result {
                 result = interpreter.step();
             }
-            (interpreter.initial_insn_count, interpreter.due_insn_count)
+            (
+                interpreter.due_insn_count,
+                match result {
+                    Ok(None) => unreachable!(),
+                    Ok(Some(value)) => ProgramResult::Ok(value),
+                    Err(error) => ProgramResult::Err(error),
+                },
+            )
+        } else {
+            #[cfg(feature = "jit")]
+            {
+                let mut result = ProgramResult::Ok(0);
+                let compiled_program = match executable
+                    .get_compiled_program()
+                    .ok_or(EbpfError::JitNotCompiled)
+                {
+                    Ok(compiled_program) => compiled_program,
+                    Err(error) => return (0, ProgramResult::Err(error)),
+                };
+                let instruction_meter_final = unsafe {
+                    (compiled_program.main)(
+                        &mut result,
+                        &mut self.memory_mapping,
+                        self.context_object,
+                    )
+                }
+                .max(0) as u64;
+                (
+                    self.context_object
+                        .get_remaining()
+                        .saturating_sub(instruction_meter_final),
+                    match result {
+                        ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, _)) => {
+                            ProgramResult::Err(EbpfError::ExceededMaxInstructions(
+                                pc,
+                                initial_insn_count,
+                            ))
+                        }
+                        x => x,
+                    },
+                )
+            }
+            #[cfg(not(feature = "jit"))]
+            (0, ProgramResult::Err(EbpfError::JitNotCompiled))
         };
-        let total_insn_count = if self
-            .verified_executable
-            .get_executable()
-            .get_config()
-            .enable_instruction_meter
-        {
+        let instruction_count = if executable.get_config().enable_instruction_meter {
             self.context_object.consume(due_insn_count);
             initial_insn_count.saturating_sub(self.context_object.get_remaining())
         } else {
             0
         };
-        match result {
-            Ok(None) => unreachable!(),
-            Ok(Some(value)) => (total_insn_count, ProgramResult::Ok(value)),
-            Err(error) => (total_insn_count, ProgramResult::Err(error)),
-        }
-    }
-
-    /// Execute the previously JIT-compiled program, with the given packet data in a manner
-    /// very similar to `execute_program_interpreted()`.
-    ///
-    /// # Safety
-    ///
-    /// **WARNING:** JIT-compiled assembly code is not safe. It may be wise to check that
-    /// the program works with the interpreter before running the JIT-compiled version of it.
-    ///
-    #[cfg(feature = "jit")]
-    pub fn execute_program_jit(&mut self) -> (u64, ProgramResult) {
-        let executable = self.verified_executable.get_executable();
-        let initial_insn_count = if executable.get_config().enable_instruction_meter {
-            self.context_object.get_remaining()
-        } else {
-            0
-        };
-        let mut result = ProgramResult::Ok(0);
-        let compiled_program = match executable
-            .get_compiled_program()
-            .ok_or(EbpfError::JitNotCompiled)
-        {
-            Ok(compiled_program) => compiled_program,
-            Err(error) => return (0, ProgramResult::Err(error)),
-        };
-        let instruction_meter_final = unsafe {
-            (compiled_program.main)(&mut result, &mut self.memory_mapping, self.context_object)
-        }
-        .max(0) as u64;
-        let total_insn_count = if executable.get_config().enable_instruction_meter {
-            let remaining_insn_count = self.context_object.get_remaining();
-            let due_insn_count = remaining_insn_count.saturating_sub(instruction_meter_final);
-            self.context_object.consume(due_insn_count);
-            initial_insn_count
-                .saturating_add(due_insn_count)
-                .saturating_sub(remaining_insn_count)
-            // Same as:
-            // initial_insn_count.saturating_sub(self.context_object.get_remaining())
-        } else {
-            0
-        };
-        match result {
-            ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, _)) => (
-                total_insn_count,
-                ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, initial_insn_count)),
-            ),
-            x => (total_insn_count, x),
-        }
+        (instruction_count, result)
     }
 }
 
