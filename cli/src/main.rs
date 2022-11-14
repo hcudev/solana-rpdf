@@ -144,13 +144,13 @@ fn main() {
         verified_executable.jit_compile().unwrap();
     }
     let mem_region = MemoryRegion::new_writable(&mut mem, ebpf::MM_INPUT_START);
-    let mut context_object = TestContextObject {
-        remaining: matches
+    let mut context_object = TestContextObject::new(
+        matches
             .value_of("instruction limit")
             .unwrap()
             .parse::<u64>()
             .unwrap(),
-    };
+    );
     let mut vm = EbpfVm::new(
         &verified_executable,
         &mut context_object,
@@ -204,13 +204,13 @@ fn main() {
     if matches.is_present("trace") {
         println!("Trace:\n");
         let stdout = std::io::stdout();
-        vm.tracer
-            .write(&mut stdout.lock(), analysis.as_ref().unwrap())
+        vm.context_object
+            .write_trace_log(&mut stdout.lock(), analysis.as_ref().unwrap())
             .unwrap();
     }
     if matches.is_present("profile") {
-        let tracer = &vm.tracer;
-        let dynamic_analysis = DynamicAnalysis::new(tracer, analysis.as_ref().unwrap());
+        let dynamic_analysis =
+            DynamicAnalysis::new(&vm.context_object.trace_log, analysis.as_ref().unwrap());
         let mut file = File::create("profile.dot").unwrap();
         analysis
             .as_ref()
