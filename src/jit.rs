@@ -10,25 +10,17 @@
 // the MIT license <http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-#![allow(clippy::deprecated_cfg_attr)]
-#![cfg_attr(rustfmt, rustfmt_skip)]
-#![allow(unreachable_code)]
-
 extern crate libc;
 
-use std::{
-    fmt::Debug, mem,
-    ptr,
-    marker::PhantomData,
-};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
+use std::{fmt::Debug, marker::PhantomData, mem, ptr};
 
 use crate::{
+    ebpf::{self, FIRST_SCRATCH_REG, FRAME_PTR_REG, INSN_SIZE, SCRATCH_REGS, STACK_PTR_REG},
     elf::Executable,
-    vm::{Config, ProgramResult, ContextObject, SyscallFunction},
-    ebpf::{self, INSN_SIZE, FIRST_SCRATCH_REG, SCRATCH_REGS, FRAME_PTR_REG, STACK_PTR_REG},
     error::EbpfError,
     memory_region::{AccessType, MemoryMapping},
+    vm::{Config, ContextObject, ProgramResult, RuntimeEnvironment, SyscallFunction},
     x86::*,
 };
 
@@ -79,50 +71,70 @@ fn round_to_page_size(value: usize, page_size: usize) -> usize {
     (value + page_size - 1) / page_size * page_size
 }
 
-#[allow(unused_variables)]
 impl<C: ContextObject> JitProgram<C> {
     fn new(pc: usize, code_size: usize) -> Result<Self, EbpfError> {
-        #[cfg(target_os = "windows")]
-        {
-            Ok(Self {
-                page_size: 0,
-                pc_section: &mut [],
-                text_section: &mut [],
-                _marker: PhantomData::default(),
-            })
-        }
-        #[cfg(not(target_os = "windows"))]
         unsafe {
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             let pc_loc_table_size = round_to_page_size(pc * 8, page_size);
             let over_allocated_code_size = round_to_page_size(code_size, page_size);
             let mut raw: *mut libc::c_void = std::ptr::null_mut();
-            libc_error_guard!(mmap, &mut raw, pc_loc_table_size + over_allocated_code_size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANONYMOUS | libc::MAP_PRIVATE, 0, 0);
+            libc_error_guard!(
+                mmap,
+                &mut raw,
+                pc_loc_table_size + over_allocated_code_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                0,
+                0
+            );
             Ok(Self {
                 page_size,
                 pc_section: std::slice::from_raw_parts_mut(raw as *mut usize, pc),
-                text_section: std::slice::from_raw_parts_mut(raw.add(pc_loc_table_size) as *mut u8, over_allocated_code_size),
+                text_section: std::slice::from_raw_parts_mut(
+                    raw.add(pc_loc_table_size) as *mut u8,
+                    over_allocated_code_size,
+                ),
                 _marker: PhantomData::default(),
             })
         }
     }
 
     fn seal(&mut self, text_section_usage: usize) -> Result<(), EbpfError> {
-        if self.page_size > 0 {
+        if self.page_size == 0 {
+            return Ok(());
+        }
+        unsafe {
             let raw = self.pc_section.as_ptr() as *mut u8;
             let pc_loc_table_size = round_to_page_size(self.pc_section.len() * 8, self.page_size);
-            let over_allocated_code_size = round_to_page_size(self.text_section.len(), self.page_size);
+            let over_allocated_code_size =
+                round_to_page_size(self.text_section.len(), self.page_size);
             let code_size = round_to_page_size(text_section_usage, self.page_size);
-            #[cfg(not(target_os = "windows"))]
-            unsafe {
-                if over_allocated_code_size > code_size {
-                    libc_error_guard!(munmap, raw.add(pc_loc_table_size).add(code_size) as *mut _, over_allocated_code_size - code_size);
-                }
-                std::ptr::write_bytes(raw.add(pc_loc_table_size).add(text_section_usage), 0xcc, code_size - text_section_usage); // Fill with debugger traps
-                self.text_section = std::slice::from_raw_parts_mut(raw.add(pc_loc_table_size), text_section_usage);
-                libc_error_guard!(mprotect, self.pc_section.as_mut_ptr() as *mut _, pc_loc_table_size, libc::PROT_READ);
-                libc_error_guard!(mprotect, self.text_section.as_mut_ptr() as *mut _, code_size, libc::PROT_EXEC | libc::PROT_READ);
+            if over_allocated_code_size > code_size {
+                libc_error_guard!(
+                    munmap,
+                    raw.add(pc_loc_table_size).add(code_size) as *mut _,
+                    over_allocated_code_size - code_size
+                );
             }
+            std::ptr::write_bytes(
+                raw.add(pc_loc_table_size).add(text_section_usage),
+                0xcc,
+                code_size - text_section_usage,
+            ); // Fill with debugger traps
+            self.text_section =
+                std::slice::from_raw_parts_mut(raw.add(pc_loc_table_size), text_section_usage);
+            libc_error_guard!(
+                mprotect,
+                self.pc_section.as_mut_ptr() as *mut _,
+                pc_loc_table_size,
+                libc::PROT_READ
+            );
+            libc_error_guard!(
+                mprotect,
+                self.text_section.as_mut_ptr() as *mut _,
+                code_size,
+                libc::PROT_EXEC | libc::PROT_READ
+            );
         }
         Ok(())
     }
@@ -134,9 +146,6 @@ impl<C: ContextObject> JitProgram<C> {
         registers: [u64; 10],
         target_pc: usize,
     ) -> i64 {
-        #[cfg(target_os = "windows")]
-        unimplemented!();
-        #[cfg(not(target_os = "windows"))]
         unsafe {
             let mut instruction_meter = env.previous_instruction_meter as i64 + target_pc as i64;
             std::arch::asm!(
@@ -193,7 +202,10 @@ impl<C: ContextObject> Drop for JitProgram<C> {
         if pc_loc_table_size + code_size > 0 {
             #[cfg(not(target_os = "windows"))]
             unsafe {
-                libc::munmap(self.pc_section.as_ptr() as *mut _, pc_loc_table_size + code_size);
+                libc::munmap(
+                    self.pc_section.as_ptr() as *mut _,
+                    pc_loc_table_size + code_size,
+                );
             }
         }
     }
@@ -253,8 +265,8 @@ const REGISTER_MAP: [u8; 11] = [
 
 #[derive(Copy, Clone, Debug)]
 pub enum OperandSize {
-    S0  = 0,
-    S8  = 8,
+    S0 = 0,
+    S8 = 8,
     S16 = 16,
     S32 = 32,
     S64 = 64,
@@ -277,38 +289,6 @@ struct Argument {
 struct Jump {
     location: *const u8,
     target_pc: usize,
-}
-
-#[repr(C)]
-pub struct RuntimeEnvironment<'a, C: ContextObject> {
-    /// Needed to exit from the guest back into the host
-    pub host_stack_pointer: *mut u64,
-    /// The current call depth.
-    ///
-    /// Incremented on calls and decremented on exits. It's used to enforce
-    /// config.max_call_depth and to know when to terminate execution.
-    pub call_depth: u64,
-    /// Guest frame pointer (REGISTER_MAP[FRAME_PTR_REG]).
-    pub frame_pointer: u64,
-    /// Guest stack pointer (r11). Only used when config.dynamic_stack_frames=true.
-    ///
-    /// The stack pointer isn't exposed as an actual register. Only sub and add
-    /// instructions (typically generated by the LLVM backend) are allowed to
-    /// access it. Its value is only stored in this slot and therefore the
-    /// register is not tracked in REGISTER_MAP.
-    pub stack_pointer: u64,
-    /// Pointer to ProgramResult
-    pub program_result_pointer: *mut ProgramResult,
-    /// Pointer to ContextObject
-    pub context_object_pointer: &'a mut C,
-    /// Last return value of instruction_meter.get_remaining()
-    pub previous_instruction_meter: u64,
-    /// CPU cycles accumulated by the stop watch
-    pub stopwatch_numerator: u64,
-    /// Number of times the stop watch was used
-    pub stopwatch_denominator: u64,
-    /// MemoryMapping inlined
-    pub memory_mapping: MemoryMapping<'a>,
 }
 
 /// Indices of slots inside RuntimeEnvironment
@@ -390,21 +370,10 @@ pub struct JitCompiler<'a, C: ContextObject> {
     stopwatch_is_active: bool,
 }
 
+#[rustfmt::skip]
 impl<'a, C: ContextObject> JitCompiler<'a, C> {
     /// Constructs a new compiler and allocates memory for the compilation output
     pub fn new(executable: &'a Executable<C>) -> Result<Self, EbpfError> {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = executable;
-            panic!("JIT not supported on windows");
-        }
-
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = executable;
-            panic!("JIT is only supported on x86_64");
-        }
-
         let config = executable.get_config();
         let (program_vm_addr, program) = executable.get_text_bytes();
 
@@ -426,7 +395,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             code_length_estimate += pc / config.instruction_meter_checkpoint_distance * MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT;
         }
         
-        let mut diversification_rng = SmallRng::from_rng(rand::thread_rng()).unwrap();
+        let mut diversification_rng = SmallRng::from_rng(rand::thread_rng()).map_err(|_| EbpfError::JitNotCompiled)?;
         Ok(Self {
             result: JitProgram::new(pc, code_length_estimate)?,
             text_section_jumps: vec![],
@@ -1600,20 +1569,20 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 #[cfg(all(test, target_arch = "x86_64", not(target_os = "windows")))]
 mod tests {
     use super::*;
-    use crate::{syscalls, vm::{SyscallRegistry, TestContextObject, FunctionRegistry}};
-    use byteorder::{LittleEndian, ByteOrder};
+    use crate::{
+        syscalls,
+        vm::{FunctionRegistry, SyscallRegistry, TestContextObject},
+    };
+    use byteorder::{ByteOrder, LittleEndian};
 
-    fn create_mockup_executable(program: &[u8]) -> Executable::<TestContextObject> {
+    fn create_mockup_executable(program: &[u8]) -> Executable<TestContextObject> {
         let config = Config {
             noop_instruction_rate: 0,
             ..Config::default()
         };
         let mut syscall_registry = SyscallRegistry::default();
         syscall_registry
-            .register_syscall_by_hash(
-                0xFFFFFFFF,
-                syscalls::bpf_gather_bytes,
-            )
+            .register_syscall_by_hash(0xFFFFFFFF, syscalls::bpf_gather_bytes)
             .unwrap();
         let mut function_registry = FunctionRegistry::default();
         function_registry.insert(0xFFFFFFFF, (8, "foo".to_string()));
@@ -1630,36 +1599,54 @@ mod tests {
     fn test_code_length_estimate() {
         const INSTRUCTION_COUNT: usize = 256;
         let mut prog = [0; ebpf::INSN_SIZE * INSTRUCTION_COUNT];
-    
+
         let empty_program_machine_code_length = {
             prog[0] = ebpf::EXIT;
             let mut executable = create_mockup_executable(&prog[0..ebpf::INSN_SIZE]);
             Executable::<TestContextObject>::jit_compile(&mut executable).unwrap();
-            executable.get_compiled_program().unwrap().machine_code_length()
+            executable
+                .get_compiled_program()
+                .unwrap()
+                .machine_code_length()
         };
         assert!(empty_program_machine_code_length <= MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH);
-    
+
         for opcode in 0..255 {
             for pc in 0..INSTRUCTION_COUNT {
                 prog[pc * ebpf::INSN_SIZE] = opcode;
                 prog[pc * ebpf::INSN_SIZE + 1] = 0x88;
                 prog[pc * ebpf::INSN_SIZE + 2] = 0xFF;
                 prog[pc * ebpf::INSN_SIZE + 3] = 0xFF;
-                LittleEndian::write_u32(&mut prog[pc * ebpf::INSN_SIZE + 4..], match opcode {
-                    0x8D => 8,
-                    0xD4 | 0xDC => 16,
-                    _ => 0xFFFFFFFF,
-                });
+                LittleEndian::write_u32(
+                    &mut prog[pc * ebpf::INSN_SIZE + 4..],
+                    match opcode {
+                        0x8D => 8,
+                        0xD4 | 0xDC => 16,
+                        _ => 0xFFFFFFFF,
+                    },
+                );
             }
             let mut executable = create_mockup_executable(&prog);
             let result = Executable::<TestContextObject>::jit_compile(&mut executable);
             if result.is_err() {
-                assert!(matches!(result.unwrap_err(), EbpfError::UnsupportedInstruction(_)));
+                assert!(matches!(
+                    result.unwrap_err(),
+                    EbpfError::UnsupportedInstruction(_)
+                ));
                 continue;
             }
-            let machine_code_length = executable.get_compiled_program().unwrap().machine_code_length() - empty_program_machine_code_length;
-            let instruction_count = if opcode == 0x18 { INSTRUCTION_COUNT / 2 } else { INSTRUCTION_COUNT };
-            let machine_code_length_per_instruction = (machine_code_length as f64 / instruction_count as f64 + 0.5) as usize;
+            let machine_code_length = executable
+                .get_compiled_program()
+                .unwrap()
+                .machine_code_length()
+                - empty_program_machine_code_length;
+            let instruction_count = if opcode == 0x18 {
+                INSTRUCTION_COUNT / 2
+            } else {
+                INSTRUCTION_COUNT
+            };
+            let machine_code_length_per_instruction =
+                (machine_code_length as f64 / instruction_count as f64 + 0.5) as usize;
             assert!(machine_code_length_per_instruction <= MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION);
         }
     }

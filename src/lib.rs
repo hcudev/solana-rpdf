@@ -15,6 +15,7 @@
     html_logo_url = "https://raw.githubusercontent.com/qmonnet/rbpf/master/misc/rbpf.png",
     html_favicon_url = "https://raw.githubusercontent.com/qmonnet/rbpf/master/misc/rbpf.ico"
 )]
+#![deny(clippy::integer_arithmetic)]
 
 extern crate byteorder;
 extern crate combine;
@@ -38,14 +39,14 @@ pub mod error;
 pub mod fuzz;
 pub mod insn_builder;
 pub mod interpreter;
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
 mod jit;
 pub mod memory_region;
 pub mod static_analysis;
 pub mod syscalls;
 pub mod verifier;
 pub mod vm;
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
 mod x86;
 
 trait ErrCheckedArithmetic: Sized {
