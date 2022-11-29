@@ -19,10 +19,12 @@ use crate::{
     elf::Executable,
     error::EbpfError,
     interpreter::Interpreter,
+    jit::RuntimeEnvironment,
     memory_region::{MemoryMapping, MemoryRegion},
     static_analysis::Analysis,
     verifier::Verifier,
 };
+use rand::Rng;
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Debug,
@@ -185,6 +187,11 @@ impl<C: ContextObject> PartialEq for SyscallRegistry<C> {
     }
 }
 
+/// Shift the Config::runtime_environment_key by this many bits to the LSB
+///
+/// 3 bits for 8 Byte alignment, and 1 bit to have encoding space for the RuntimeEnvironment.
+pub const PROGRAM_ENVIRONMENT_KEY_SHIFT: u32 = 4;
+
 /// VM configuration settings
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
@@ -208,8 +215,10 @@ pub struct Config {
     pub noop_instruction_rate: u32,
     /// Enable disinfection of immediate values and offsets provided by the user in JIT
     pub sanitize_user_provided_values: bool,
-    /// Encrypt the environment registers in JIT
-    pub encrypt_environment_registers: bool,
+    /// Encrypt the runtime environment in JIT
+    ///
+    /// Use 0 to disable encryption. Otherwise only leave PROGRAM_ENVIRONMENT_KEY_SHIFT MSBs 0.
+    pub runtime_environment_key: i32,
     /// Throw ElfError::SymbolHashCollision when a BPF function collides with a registered syscall
     pub syscall_bpf_function_hash_collision: bool,
     /// Have the verifier reject "callx r10"
@@ -254,7 +263,8 @@ impl Default for Config {
             reject_broken_elfs: false,
             noop_instruction_rate: 256,
             sanitize_user_provided_values: true,
-            encrypt_environment_registers: true,
+            runtime_environment_key: rand::thread_rng().gen::<i32>()
+                >> PROGRAM_ENVIRONMENT_KEY_SHIFT,
             syscall_bpf_function_hash_collision: true,
             reject_callx_r10: true,
             dynamic_stack_frames: true,
@@ -478,11 +488,9 @@ impl DynamicAnalysis {
 /// ```
 pub struct EbpfVm<'a, V: Verifier, C: ContextObject> {
     pub(crate) verified_executable: &'a VerifiedExecutable<V, C>,
-    /// The MemoryMapping describing the address space of the program
-    pub(crate) memory_mapping: MemoryMapping<'a>,
-    /// Pointer to the context object of syscalls
-    pub context_object: &'a mut C,
     pub(crate) stack: CallFrames<'a>,
+    /// Runtime state
+    pub env: RuntimeEnvironment<'a, C>,
 }
 
 impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
@@ -496,6 +504,14 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
         let executable = verified_executable.get_executable();
         let config = executable.get_config();
         let mut stack = CallFrames::new(config);
+        // Initialize the BPF frame and stack pointers (FramePointer and StackPointer)
+        let stack_pointer = if config.dynamic_stack_frames {
+            // The stack is fully descending from MM_STACK_START + stack_size to MM_STACK_START
+            ebpf::MM_STACK_START + config.stack_size() as u64
+        } else {
+            // The frames are ascending from MM_STACK_START to MM_STACK_START + stack_size. The stack within the frames is descending.
+            ebpf::MM_STACK_START + config.stack_frame_size as u64
+        };
         let regions: Vec<MemoryRegion> = vec![
             verified_executable.get_executable().get_ro_region(),
             stack.get_memory_region(),
@@ -506,9 +522,19 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
         .collect();
         let vm = EbpfVm {
             verified_executable,
-            memory_mapping: MemoryMapping::new(regions, config)?,
-            context_object,
             stack,
+            env: RuntimeEnvironment {
+                host_stack_pointer: std::ptr::null_mut(),
+                call_depth: 0,
+                frame_pointer: stack_pointer,
+                stack_pointer,
+                program_result_pointer: std::ptr::null_mut(),
+                context_object_pointer: context_object,
+                previous_instruction_meter: 0,
+                stopwatch_numerator: 0,
+                stopwatch_denominator: 0,
+                memory_mapping: MemoryMapping::new(regions, config)?,
+            },
         };
         Ok(vm)
     }
@@ -518,11 +544,13 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
     /// If interpreted = `false` then the JIT compiled executable is used.
     pub fn execute_program(&mut self, interpreted: bool) -> (u64, ProgramResult) {
         let executable = self.verified_executable.get_executable();
-        let initial_insn_count = if executable.get_config().enable_instruction_meter {
-            self.context_object.get_remaining()
+        let config = executable.get_config();
+        let initial_insn_count = if config.enable_instruction_meter {
+            self.env.context_object_pointer.get_remaining()
         } else {
             0
         };
+        self.env.previous_instruction_meter = initial_insn_count;
         let (due_insn_count, result) = if interpreted {
             let mut result = Ok(None);
             let mut interpreter = match Interpreter::new(self) {
@@ -544,6 +572,7 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
             #[cfg(feature = "jit")]
             {
                 let mut result = ProgramResult::Ok(0);
+                self.env.program_result_pointer = &mut result;
                 let compiled_program = match executable
                     .get_compiled_program()
                     .ok_or(EbpfError::JitNotCompiled)
@@ -551,37 +580,33 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
                     Ok(compiled_program) => compiled_program,
                     Err(error) => return (0, ProgramResult::Err(error)),
                 };
-                let instruction_meter_final = unsafe {
-                    (compiled_program.main)(
-                        &mut result,
-                        &mut self.memory_mapping,
-                        self.context_object,
-                    )
-                }
-                .max(0) as u64;
+                let registers = [0, ebpf::MM_INPUT_START, 0, 0, 0, 0, 0, 0, 0, 0];
+                let target_pc = executable.get_entrypoint_instruction_offset();
+                let instruction_meter_final = compiled_program
+                    .invoke(config, &mut self.env, registers, target_pc)
+                    .max(0) as u64;
                 (
-                    self.context_object
+                    self.env
+                        .context_object_pointer
                         .get_remaining()
                         .saturating_sub(instruction_meter_final),
-                    match result {
-                        ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, _)) => {
-                            ProgramResult::Err(EbpfError::ExceededMaxInstructions(
-                                pc,
-                                initial_insn_count,
-                            ))
-                        }
-                        x => x,
-                    },
+                    result,
                 )
             }
             #[cfg(not(feature = "jit"))]
             (0, ProgramResult::Err(EbpfError::JitNotCompiled))
         };
-        let instruction_count = if executable.get_config().enable_instruction_meter {
-            self.context_object.consume(due_insn_count);
-            initial_insn_count.saturating_sub(self.context_object.get_remaining())
+        let instruction_count = if config.enable_instruction_meter {
+            self.env.context_object_pointer.consume(due_insn_count);
+            initial_insn_count.saturating_sub(self.env.context_object_pointer.get_remaining())
         } else {
             0
+        };
+        let result = match result {
+            ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, _)) => {
+                ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, initial_insn_count))
+            }
+            x => x,
         };
         (instruction_count, result)
     }
