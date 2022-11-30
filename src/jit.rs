@@ -295,14 +295,13 @@ struct Jump {
 enum RuntimeEnvironmentSlot {
     HostStackPointer = 0,
     CallDepth = 1,
-    FramePointer = 2,
-    StackPointer = 3,
-    ContextObjectPointer = 4,
-    PreviousInstructionMeter = 5,
-    StopwatchNumerator = 6,
-    StopwatchDenominator = 7,
-    ProgramResult = 8,
-    MemoryMapping = 16,
+    StackPointer = 2,
+    ContextObjectPointer = 3,
+    PreviousInstructionMeter = 4,
+    StopwatchNumerator = 5,
+    StopwatchDenominator = 6,
+    ProgramResult = 7,
+    MemoryMapping = 15,
 }
 
 /* Explaination of the Instruction Meter
@@ -707,6 +706,12 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 5, REGISTER_MAP[FRAME_PTR_REG], 1, None));
                     self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_MAP[FRAME_PTR_REG], RBP, call_depth_access));
 
+                    if !self.config.dynamic_stack_frames {
+                        let stack_pointer_access = X86IndirectAccess::Offset(self.slot_on_environment_stack(RuntimeEnvironmentSlot::StackPointer));
+                        let stack_frame_size = self.config.stack_frame_size as i64 * if self.config.enable_stack_frame_gaps { 2 } else { 1 };
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 5, RBP, stack_frame_size, Some(stack_pointer_access))); // env.stack_pointer -= stack_frame_size;
+                    }
+
                     // and return
                     self.emit_validate_and_profile_instruction_count(false, Some(0));
                     self.emit_ins(X86Instruction::return_near());
@@ -1046,8 +1051,6 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
         // Restore the previous frame pointer
         self.emit_ins(X86Instruction::pop(REGISTER_MAP[FRAME_PTR_REG]));
-        let frame_ptr_access = X86IndirectAccess::Offset(self.slot_on_environment_stack(RuntimeEnvironmentSlot::FramePointer));
-        self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_MAP[FRAME_PTR_REG], RBP, frame_ptr_access));
         for reg in REGISTER_MAP.iter().skip(FIRST_SCRATCH_REG).take(SCRATCH_REGS).rev() {
             self.emit_ins(X86Instruction::pop(*reg));
         }
@@ -1418,18 +1421,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::conditional_jump_immediate(0x83, self.relative_to_anchor(ANCHOR_CALL_DEPTH_EXCEEDED, 6)));
 
         // Setup the frame pointer for the new frame. What we do depends on whether we're using dynamic or fixed frames.
-        let frame_ptr_access = X86IndirectAccess::Offset(self.slot_on_environment_stack(RuntimeEnvironmentSlot::FramePointer));
-        if self.config.dynamic_stack_frames {
-            // When dynamic frames are on, the next frame starts at the end of the current frame
-            let stack_ptr_access = X86IndirectAccess::Offset(self.slot_on_environment_stack(RuntimeEnvironmentSlot::StackPointer));
-            self.emit_ins(X86Instruction::load(OperandSize::S64, RBP, REGISTER_MAP[FRAME_PTR_REG], stack_ptr_access));
-            self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_MAP[FRAME_PTR_REG], RBP, frame_ptr_access));
-        } else {
+        let stack_pointer_access = X86IndirectAccess::Offset(self.slot_on_environment_stack(RuntimeEnvironmentSlot::StackPointer));
+        if !self.config.dynamic_stack_frames {
             // With fixed frames we start the new frame at the next fixed offset
             let stack_frame_size = self.config.stack_frame_size as i64 * if self.config.enable_stack_frame_gaps { 2 } else { 1 };
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, RBP, stack_frame_size, Some(frame_ptr_access))); // frame_ptr += stack_frame_size;
-            self.emit_ins(X86Instruction::load(OperandSize::S64, RBP, REGISTER_MAP[FRAME_PTR_REG], frame_ptr_access)); // Load FramePointer
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, RBP, stack_frame_size, Some(stack_pointer_access))); // env.stack_pointer += stack_frame_size;
         }
+        self.emit_ins(X86Instruction::load(OperandSize::S64, RBP, REGISTER_MAP[FRAME_PTR_REG], stack_pointer_access)); // reg[ebpf::FRAME_PTR_REG] = env.stack_pointer;
         self.emit_ins(X86Instruction::return_near());
 
         // Routine for emit_bpf_call(Value::Register())
@@ -1462,7 +1460,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_MAP[FRAME_PTR_REG], REGISTER_MAP[0], 0, None)); // RAX += self.result.pc_section;
         self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_MAP[0], REGISTER_MAP[0], X86IndirectAccess::Offset(0))); // RAX = self.result.pc_section[RAX / 8];
         // Load the frame pointer again since we've clobbered REGISTER_MAP[FRAME_PTR_REG]
-        self.emit_ins(X86Instruction::load(OperandSize::S64, RBP, REGISTER_MAP[FRAME_PTR_REG], X86IndirectAccess::Offset(self.slot_on_environment_stack(RuntimeEnvironmentSlot::FramePointer))));
+        self.emit_ins(X86Instruction::load(OperandSize::S64, RBP, REGISTER_MAP[FRAME_PTR_REG], X86IndirectAccess::Offset(self.slot_on_environment_stack(RuntimeEnvironmentSlot::StackPointer))));
         self.emit_ins(X86Instruction::return_near());
 
         // Translates a vm memory address to a host memory address
@@ -1583,7 +1581,6 @@ mod tests {
         let env = RuntimeEnvironment {
             host_stack_pointer: std::ptr::null_mut(),
             call_depth: 0,
-            frame_pointer: 0,
             stack_pointer: 0,
             context_object_pointer: &mut context_object,
             previous_instruction_meter: 0,
@@ -1608,7 +1605,6 @@ mod tests {
 
         check_slot!(env, host_stack_pointer, HostStackPointer);
         check_slot!(env, call_depth, CallDepth);
-        check_slot!(env, frame_pointer, FramePointer);
         check_slot!(env, stack_pointer, StackPointer);
         check_slot!(env, context_object_pointer, ContextObjectPointer);
         check_slot!(env, previous_instruction_meter, PreviousInstructionMeter);
