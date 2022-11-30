@@ -489,8 +489,6 @@ pub struct RuntimeEnvironment<'a, C: ContextObject> {
     /// access it. Its value is only stored in this slot and therefore the
     /// register is not tracked in REGISTER_MAP.
     pub stack_pointer: u64,
-    /// Pointer to ProgramResult
-    pub program_result_pointer: *mut ProgramResult,
     /// Pointer to ContextObject
     pub context_object_pointer: &'a mut C,
     /// Last return value of instruction_meter.get_remaining()
@@ -499,6 +497,8 @@ pub struct RuntimeEnvironment<'a, C: ContextObject> {
     pub stopwatch_numerator: u64,
     /// Number of times the stop watch was used
     pub stopwatch_denominator: u64,
+    /// ProgramResult inlined
+    pub program_result: ProgramResult,
     /// MemoryMapping inlined
     pub memory_mapping: MemoryMapping<'a>,
     /// Stack of CallFrames used by the Interpreter
@@ -581,11 +581,11 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
                 call_depth: 0,
                 frame_pointer: stack_pointer,
                 stack_pointer,
-                program_result_pointer: std::ptr::null_mut(),
                 context_object_pointer: context_object,
                 previous_instruction_meter: 0,
                 stopwatch_numerator: 0,
                 stopwatch_denominator: 0,
+                program_result: ProgramResult::Ok(0),
                 memory_mapping: MemoryMapping::new(regions, config)?,
                 call_frames: vec![CallFrame::default(); config.max_call_depth],
             },
@@ -610,28 +610,17 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
             0
         };
         self.env.previous_instruction_meter = initial_insn_count;
-        let (due_insn_count, result) = if interpreted {
-            let mut result = Ok(None);
+        self.env.program_result = ProgramResult::Ok(0);
+        let due_insn_count = if interpreted {
             let mut interpreter = match Interpreter::new(self, registers, target_pc) {
                 Ok(interpreter) => interpreter,
                 Err(error) => return (0, ProgramResult::Err(error)),
             };
-            while let Ok(None) = result {
-                result = interpreter.step();
-            }
-            (
-                interpreter.due_insn_count,
-                match result {
-                    Ok(None) => unreachable!(),
-                    Ok(Some(value)) => ProgramResult::Ok(value),
-                    Err(error) => ProgramResult::Err(error),
-                },
-            )
+            while interpreter.step() {}
+            interpreter.due_insn_count
         } else {
             #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
             {
-                let mut result = ProgramResult::Ok(0);
-                self.env.program_result_pointer = &mut result;
                 let compiled_program = match executable
                     .get_compiled_program()
                     .ok_or(EbpfError::JitNotCompiled)
@@ -642,16 +631,15 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
                 let instruction_meter_final = compiled_program
                     .invoke(config, &mut self.env, registers, target_pc)
                     .max(0) as u64;
-                (
-                    self.env
-                        .context_object_pointer
-                        .get_remaining()
-                        .saturating_sub(instruction_meter_final),
-                    result,
-                )
+                self.env
+                    .context_object_pointer
+                    .get_remaining()
+                    .saturating_sub(instruction_meter_final)
             }
             #[cfg(not(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64")))]
-            (0, ProgramResult::Err(EbpfError::JitNotCompiled))
+            {
+                return (0, ProgramResult::Err(EbpfError::JitNotCompiled));
+            }
         };
         let instruction_count = if config.enable_instruction_meter {
             self.env.context_object_pointer.consume(due_insn_count);
@@ -659,12 +647,14 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
         } else {
             0
         };
-        let result = match result {
-            ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, _)) => {
-                ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, initial_insn_count))
-            }
-            x => x,
-        };
+        if let ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, _)) =
+            self.env.program_result
+        {
+            self.env.program_result =
+                ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, initial_insn_count));
+        }
+        let mut result = ProgramResult::Ok(0);
+        std::mem::swap(&mut result, &mut self.env.program_result);
         (instruction_count, result)
     }
 }
