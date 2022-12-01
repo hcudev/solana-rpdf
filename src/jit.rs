@@ -10,8 +10,6 @@
 // the MIT license <http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-extern crate libc;
-
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::{fmt::Debug, marker::PhantomData, mem, ptr};
 
@@ -19,6 +17,9 @@ use crate::{
     ebpf::{self, FIRST_SCRATCH_REG, FRAME_PTR_REG, INSN_SIZE, SCRATCH_REGS, STACK_PTR_REG},
     elf::Executable,
     error::EbpfError,
+    memory_management::{
+        allocate_pages, free_pages, get_system_page_size, protect_pages, round_to_page_size,
+    },
     memory_region::{AccessType, MemoryMapping},
     vm::{Config, ContextObject, ProgramResult, RuntimeEnvironment, SyscallFunction},
     x86::*,
@@ -39,59 +40,18 @@ pub struct JitProgram<C: ContextObject> {
     _marker: PhantomData<C>,
 }
 
-#[cfg(not(target_os = "windows"))]
-macro_rules! libc_error_guard {
-    (succeeded?, mmap, $addr:expr, $($arg:expr),*) => {{
-        *$addr = libc::mmap(*$addr, $($arg),*);
-        *$addr != libc::MAP_FAILED
-    }};
-    (succeeded?, $function:ident, $($arg:expr),*) => {
-        libc::$function($($arg),*) == 0
-    };
-    ($function:ident, $($arg:expr),*) => {{
-        const RETRY_COUNT: usize = 3;
-        for i in 0..RETRY_COUNT {
-            if libc_error_guard!(succeeded?, $function, $($arg),*) {
-                break;
-            } else if i + 1 == RETRY_COUNT {
-                let args = vec![$(format!("{:?}", $arg)),*];
-                #[cfg(any(target_os = "freebsd", target_os = "ios", target_os = "macos"))]
-                let errno = *libc::__error();
-                #[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
-                let errno = *libc::__errno();
-                #[cfg(target_os = "linux")]
-                let errno = *libc::__errno_location();
-                return Err(EbpfError::LibcInvocationFailed(stringify!($function), args, errno));
-            }
-        }
-    }};
-}
-
-fn round_to_page_size(value: usize, page_size: usize) -> usize {
-    (value + page_size - 1) / page_size * page_size
-}
-
 impl<C: ContextObject> JitProgram<C> {
     fn new(pc: usize, code_size: usize) -> Result<Self, EbpfError> {
+        let page_size = get_system_page_size();
+        let pc_loc_table_size = round_to_page_size(pc * 8, page_size);
+        let over_allocated_code_size = round_to_page_size(code_size, page_size);
         unsafe {
-            let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-            let pc_loc_table_size = round_to_page_size(pc * 8, page_size);
-            let over_allocated_code_size = round_to_page_size(code_size, page_size);
-            let mut raw: *mut libc::c_void = std::ptr::null_mut();
-            libc_error_guard!(
-                mmap,
-                &mut raw,
-                pc_loc_table_size + over_allocated_code_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                0,
-                0
-            );
+            let raw = allocate_pages(pc_loc_table_size + over_allocated_code_size)?;
             Ok(Self {
                 page_size,
                 pc_section: std::slice::from_raw_parts_mut(raw as *mut usize, pc),
                 text_section: std::slice::from_raw_parts_mut(
-                    raw.add(pc_loc_table_size) as *mut u8,
+                    (raw as *mut u8).add(pc_loc_table_size),
                     over_allocated_code_size,
                 ),
                 _marker: PhantomData::default(),
@@ -103,38 +63,31 @@ impl<C: ContextObject> JitProgram<C> {
         if self.page_size == 0 {
             return Ok(());
         }
+        let raw = self.pc_section.as_ptr() as *mut u8;
+        let pc_loc_table_size = round_to_page_size(self.pc_section.len() * 8, self.page_size);
+        let over_allocated_code_size = round_to_page_size(self.text_section.len(), self.page_size);
+        let code_size = round_to_page_size(text_section_usage, self.page_size);
         unsafe {
-            let raw = self.pc_section.as_ptr() as *mut u8;
-            let pc_loc_table_size = round_to_page_size(self.pc_section.len() * 8, self.page_size);
-            let over_allocated_code_size =
-                round_to_page_size(self.text_section.len(), self.page_size);
-            let code_size = round_to_page_size(text_section_usage, self.page_size);
-            if over_allocated_code_size > code_size {
-                libc_error_guard!(
-                    munmap,
-                    raw.add(pc_loc_table_size).add(code_size) as *mut _,
-                    over_allocated_code_size - code_size
-                );
-            }
+            // Fill with debugger traps
             std::ptr::write_bytes(
                 raw.add(pc_loc_table_size).add(text_section_usage),
                 0xcc,
                 code_size - text_section_usage,
-            ); // Fill with debugger traps
+            );
+            if over_allocated_code_size > code_size {
+                free_pages(
+                    raw.add(pc_loc_table_size).add(code_size),
+                    over_allocated_code_size - code_size,
+                )?;
+            }
             self.text_section =
                 std::slice::from_raw_parts_mut(raw.add(pc_loc_table_size), text_section_usage);
-            libc_error_guard!(
-                mprotect,
-                self.pc_section.as_mut_ptr() as *mut _,
+            protect_pages(
+                self.pc_section.as_mut_ptr() as *mut u8,
                 pc_loc_table_size,
-                libc::PROT_READ
-            );
-            libc_error_guard!(
-                mprotect,
-                self.text_section.as_mut_ptr() as *mut _,
-                code_size,
-                libc::PROT_EXEC | libc::PROT_READ
-            );
+                false,
+            )?;
+            protect_pages(self.text_section.as_mut_ptr(), code_size, true)?;
         }
         Ok(())
     }
@@ -200,10 +153,9 @@ impl<C: ContextObject> Drop for JitProgram<C> {
         let pc_loc_table_size = round_to_page_size(self.pc_section.len() * 8, self.page_size);
         let code_size = round_to_page_size(self.text_section.len(), self.page_size);
         if pc_loc_table_size + code_size > 0 {
-            #[cfg(not(target_os = "windows"))]
             unsafe {
-                libc::munmap(
-                    self.pc_section.as_ptr() as *mut _,
+                let _ = free_pages(
+                    self.pc_section.as_ptr() as *mut u8,
                     pc_loc_table_size + code_size,
                 );
             }
