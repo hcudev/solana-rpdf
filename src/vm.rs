@@ -406,7 +406,12 @@ impl TestContextObject {
                 index,
                 &entry[0..11],
                 pc + ebpf::ELF_INSN_DUMP_OFFSET,
-                disassemble_instruction(insn, analysis),
+                disassemble_instruction(
+                    insn,
+                    &analysis.cfg_nodes,
+                    analysis.executable.get_syscall_symbols(),
+                    analysis.executable.get_function_registry()
+                ),
             )?;
         }
         Ok(())
