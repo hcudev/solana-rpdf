@@ -10,7 +10,7 @@
 
 use crate::ebpf;
 use crate::static_analysis::CfgNode;
-use crate::vm::FunctionRegistry;
+use crate::vm::{BuiltInProgram, ContextObject};
 use std::collections::BTreeMap;
 
 fn resolve_label(cfg_nodes: &BTreeMap<usize, CfgNode>, pc: usize) -> &str {
@@ -120,11 +120,10 @@ fn jmp_reg_str(name: &str, insn: &ebpf::Insn, cfg_nodes: &BTreeMap<usize, CfgNod
 
 /// Disassemble an eBPF instruction
 #[rustfmt::skip]
-pub fn disassemble_instruction(
+pub fn disassemble_instruction<C: ContextObject>(
     insn: &ebpf::Insn, 
     cfg_nodes: &BTreeMap<usize, CfgNode>, 
-    external_functions: &BTreeMap<u32, String>,
-    function_registry: &FunctionRegistry,
+    loader: &BuiltInProgram<C>,
 ) -> String {
     let name;
     let desc;
@@ -250,16 +249,12 @@ pub fn disassemble_instruction(
         ebpf::JSLE_IMM   => { name = "jsle"; desc = jmp_imm_str(name, insn, cfg_nodes); },
         ebpf::JSLE_REG   => { name = "jsle"; desc = jmp_reg_str(name, insn, cfg_nodes); },
         ebpf::CALL_IMM   => {
-            desc = if let Some(function_name) = external_functions.get(&(insn.imm as u32)) {
+            desc = if let Some((function_name, _function)) = loader.lookup_function(insn.imm as u32) {
                 name = "syscall";
                 format!("{} {}", name, function_name)
             } else {
                 name = "call";
-                if let Some((target_pc, _name)) = function_registry.get(&(insn.imm as u32)) {
-                    format!("{} {}", name, resolve_label(cfg_nodes, *target_pc))
-                } else {
-                    format!("{} [invalid]", name)
-                }
+                format!("{} {}", name, resolve_label(cfg_nodes, insn.imm as usize))
             };
         },
         ebpf::CALL_REG   => { name = "callx"; desc = format!("{} r{}", name, insn.imm); },

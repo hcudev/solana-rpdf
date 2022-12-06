@@ -6,13 +6,18 @@ use crate::{
     ebpf,
     elf::{self, Executable},
     error::EbpfError,
-    vm::{ContextObject, DynamicAnalysis},
+    vm::{ContextObject, DynamicAnalysis, TestContextObject},
 };
 use rustc_demangle::demangle;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+/// Register state recorded after executing one instruction
+///
+/// The last register is the program counter (aka pc).
+pub type TraceLogEntry = [u64; 12];
+
 /// Used for topological sort
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct TopologicalIndex {
     /// Strongly connected component ID
     pub scc_id: usize,
@@ -42,7 +47,7 @@ impl PartialOrd for TopologicalIndex {
 }
 
 /// A node of the control-flow graph
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CfgNode {
     /// Human readable name
     pub label: String,
@@ -119,9 +124,9 @@ impl Default for CfgNode {
 }
 
 /// Result of the executable analysis
-pub struct Analysis<'a, C: ContextObject> {
+pub struct Analysis<'a> {
     /// The program which is analyzed
-    pub executable: &'a Executable<C>,
+    executable: &'a Executable<TestContextObject>,
     /// Plain list of instructions as they occur in the executable
     pub instructions: Vec<ebpf::Insn>,
     /// Functions in the executable
@@ -140,9 +145,11 @@ pub struct Analysis<'a, C: ContextObject> {
     pub dfg_reverse_edges: BTreeMap<DfgNode, BTreeSet<DfgEdge>>,
 }
 
-impl<'a, C: ContextObject> Analysis<'a, C> {
+impl<'a> Analysis<'a> {
     /// Analyze an executable statically
-    pub fn from_executable(executable: &'a Executable<C>) -> Result<Self, EbpfError> {
+    pub fn from_executable<C: ContextObject>(
+        executable: &'a Executable<C>,
+    ) -> Result<Self, EbpfError> {
         let (_program_vm_addr, program) = executable.get_text_bytes();
         let mut functions = BTreeMap::new();
         for (key, (pc, name)) in executable.get_function_registry().iter() {
@@ -169,7 +176,8 @@ impl<'a, C: ContextObject> Analysis<'a, C> {
             insn_ptr += 1;
         }
         let mut result = Self {
-            executable,
+            // Removes the generic ContextObject which is safe because we are not going to execute the program
+            executable: unsafe { std::mem::transmute(executable) },
             instructions,
             functions,
             cfg_nodes: BTreeMap::new(),
@@ -216,10 +224,10 @@ impl<'a, C: ContextObject> Analysis<'a, C> {
             let target_pc = (insn.ptr as isize + insn.off as isize + 1) as usize;
             match insn.opc {
                 ebpf::CALL_IMM => {
-                    if let Some(function_name) = self
+                    if let Some((function_name, _function)) = self
                         .executable
-                        .get_external_functions()
-                        .get(&(insn.imm as u32))
+                        .get_loader()
+                        .lookup_function(insn.imm as u32)
                     {
                         if function_name == "abort" {
                             self.cfg_nodes
@@ -438,6 +446,11 @@ impl<'a, C: ContextObject> Analysis<'a, C> {
         Ok(())
     }
 
+    /// Generates assembler code for a single instruction
+    pub fn disassemble_instruction(&self, insn: &ebpf::Insn) -> String {
+        disassemble_instruction(insn, &self.cfg_nodes, self.executable.get_loader())
+    }
+
     /// Generates assembler code for the analyzed executable
     pub fn disassemble<W: std::io::Write>(&self, output: &mut W) -> std::io::Result<()> {
         let mut last_basic_block = usize::MAX;
@@ -448,13 +461,39 @@ impl<'a, C: ContextObject> Analysis<'a, C> {
                 insn.ptr,
                 &mut last_basic_block,
             )?;
-            let desc = disassemble_instruction(
-                insn,
-                &self.cfg_nodes,
-                self.executable.get_external_functions(),
-                self.executable.get_function_registry(),
-            );
-            writeln!(output, "    {}", desc)?;
+            writeln!(output, "    {}", self.disassemble_instruction(insn))?;
+        }
+        Ok(())
+    }
+
+    /// Use this method to print the trace log
+    pub fn disassemble_trace_log<W: std::io::Write>(
+        &self,
+        output: &mut W,
+        trace_log: &[TraceLogEntry],
+    ) -> Result<(), std::io::Error> {
+        let mut pc_to_insn_index = vec![
+            0usize;
+            self.instructions
+                .last()
+                .map(|insn| insn.ptr + 2)
+                .unwrap_or(0)
+        ];
+        for (index, insn) in self.instructions.iter().enumerate() {
+            pc_to_insn_index[insn.ptr] = index;
+            pc_to_insn_index[insn.ptr + 1] = index;
+        }
+        for (index, entry) in trace_log.iter().enumerate() {
+            let pc = entry[11] as usize;
+            let insn = &self.instructions[pc_to_insn_index[pc]];
+            writeln!(
+                output,
+                "{:5?} {:016X?} {:5?}: {}",
+                index,
+                &entry[0..11],
+                pc + ebpf::ELF_INSN_DUMP_OFFSET,
+                self.disassemble_instruction(insn),
+            )?;
         }
         Ok(())
     }
@@ -493,10 +532,10 @@ impl<'a, C: ContextObject> Analysis<'a, C> {
                 .replace('>', "&gt;")
                 .replace('\"', "&quot;")
         }
-        fn emit_cfg_node<W: std::io::Write, C: ContextObject>(
+        fn emit_cfg_node<W: std::io::Write>(
             output: &mut W,
             dynamic_analysis: Option<&DynamicAnalysis>,
-            analysis: &Analysis<C>,
+            analysis: &Analysis,
             function_range: std::ops::Range<usize>,
             alias_nodes: &mut HashSet<usize>,
             cfg_node_start: usize,
@@ -506,11 +545,8 @@ impl<'a, C: ContextObject> Analysis<'a, C> {
                 cfg_node_start,
                 analysis.instructions[cfg_node.instructions.clone()].iter()
                 .map(|insn| {
-                    let desc = disassemble_instruction(
-                        insn,
-                        &analysis.cfg_nodes,
-                        analysis.executable.get_external_functions(),
-                        analysis.executable.get_function_registry(),
+                    let desc = analysis.disassemble_instruction(
+                        insn
                     );
                     if let Some(split_index) = desc.find(' ') {
                         let mut rest = desc[split_index+1..].to_string();

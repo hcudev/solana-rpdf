@@ -14,13 +14,12 @@
 
 use crate::{
     aligned_memory::AlignedMemory,
-    disassembler::disassemble_instruction,
     ebpf,
     elf::Executable,
     error::EbpfError,
     interpreter::Interpreter,
     memory_region::{MemoryMapping, MemoryRegion},
-    static_analysis::Analysis,
+    static_analysis::{Analysis, TraceLogEntry},
     verifier::Verifier,
 };
 use rand::Rng;
@@ -109,7 +108,7 @@ pub struct BuiltInProgram<C: ContextObject> {
     /// Holds the Config if this is a loader program
     config: Option<Box<Config>>,
     /// Function pointers by symbol
-    functions: HashMap<u32, BuiltInFunction<C>>,
+    functions: HashMap<u32, (&'static str, BuiltInFunction<C>)>,
 }
 
 impl<C: ContextObject> BuiltInProgram<C> {
@@ -118,37 +117,35 @@ impl<C: ContextObject> BuiltInProgram<C> {
         self.config.as_ref().unwrap()
     }
 
-    /// Register a function by its symbol hash
-    pub fn register_function_by_hash(
+    /// Register a built-in function
+    pub fn register_function_by_name(
         &mut self,
-        hash: u32,
+        name: &'static str,
         function: BuiltInFunction<C>,
     ) -> Result<(), EbpfError> {
-        if self.functions.insert(hash, function).is_some() {
-            Err(EbpfError::SyscallAlreadyRegistered(hash as usize))
+        let key = ebpf::hash_symbol_name(name.as_bytes());
+        if self.functions.insert(key, (name, function)).is_some() {
+            Err(EbpfError::FunctionAlreadyRegistered(key as usize))
         } else {
             Ok(())
         }
     }
 
-    /// Register a function by its symbol name
-    pub fn register_function_by_name(
-        &mut self,
-        name: &[u8],
-        function: BuiltInFunction<C>,
-    ) -> Result<(), EbpfError> {
-        self.register_function_by_hash(ebpf::hash_symbol_name(name), function)
-    }
-
     /// Get a symbol's function pointer
-    pub fn lookup_function(&self, hash: u32) -> Option<BuiltInFunction<C>> {
-        self.functions.get(&hash).cloned()
+    pub fn lookup_function(&self, key: u32) -> Option<(&'static str, BuiltInFunction<C>)> {
+        self.functions.get(&key).cloned()
     }
 
     /// Calculate memory size
     pub fn mem_size(&self) -> usize {
         mem::size_of::<Self>()
-            + self.functions.capacity() * mem::size_of::<(u32, BuiltInFunction<C>)>()
+            + if self.config.is_some() {
+                mem::size_of::<Config>()
+            } else {
+                0
+            }
+            + self.functions.capacity()
+                * mem::size_of::<(u32, (&'static str, BuiltInFunction<C>))>()
     }
 }
 
@@ -347,7 +344,7 @@ pub trait ContextObject {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TestContextObject {
     /// Contains the register state at every instruction in order of execution
-    pub trace_log: Vec<[u64; 12]>,
+    pub trace_log: Vec<TraceLogEntry>,
     /// Maximal amount of instructions which still can be executed
     pub remaining: u64,
 }
@@ -376,44 +373,6 @@ impl TestContextObject {
         }
     }
 
-    /// Use this method to print the trace log
-    pub fn write_trace_log<W: std::io::Write, C: ContextObject>(
-        &self,
-        output: &mut W,
-        analysis: &Analysis<C>,
-    ) -> Result<(), std::io::Error> {
-        let mut pc_to_insn_index = vec![
-            0usize;
-            analysis
-                .instructions
-                .last()
-                .map(|insn| insn.ptr + 2)
-                .unwrap_or(0)
-        ];
-        for (index, insn) in analysis.instructions.iter().enumerate() {
-            pc_to_insn_index[insn.ptr] = index;
-            pc_to_insn_index[insn.ptr + 1] = index;
-        }
-        for (index, entry) in self.trace_log.iter().enumerate() {
-            let pc = entry[11] as usize;
-            let insn = &analysis.instructions[pc_to_insn_index[pc]];
-            writeln!(
-                output,
-                "{:5?} {:016X?} {:5?}: {}",
-                index,
-                &entry[0..11],
-                pc + ebpf::ELF_INSN_DUMP_OFFSET,
-                disassemble_instruction(
-                    insn,
-                    &analysis.cfg_nodes,
-                    analysis.executable.get_external_functions(),
-                    analysis.executable.get_function_registry()
-                ),
-            )?;
-        }
-        Ok(())
-    }
-
     /// Compares an interpreter trace and a JIT trace.
     ///
     /// The log of the JIT can be longer because it only validates the instruction meter at branches.
@@ -437,7 +396,7 @@ pub struct DynamicAnalysis {
 
 impl DynamicAnalysis {
     /// Accumulates a trace
-    pub fn new<C: ContextObject>(trace_log: &[[u64; 12]], analysis: &Analysis<C>) -> Self {
+    pub fn new(trace_log: &[[u64; 12]], analysis: &Analysis) -> Self {
         let mut result = Self {
             edge_counter_max: 0,
             edges: BTreeMap::new(),
