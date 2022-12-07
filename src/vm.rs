@@ -112,6 +112,14 @@ pub struct BuiltInProgram<C: ContextObject> {
 }
 
 impl<C: ContextObject> BuiltInProgram<C> {
+    /// Constructs a loader built-in program
+    pub fn new_loader(config: Config) -> Self {
+        Self {
+            config: Some(Box::new(config)),
+            functions: HashMap::new(),
+        }
+    }
+
     /// Get the configuration settings assuming this is a loader program
     pub fn get_config(&self) -> &Config {
         self.config.as_ref().unwrap()
@@ -276,22 +284,17 @@ impl Default for Config {
 /// Static constructors for Executable
 impl<C: ContextObject> Executable<C> {
     /// Creates an executable from an ELF file
-    pub fn from_elf(
-        elf_bytes: &[u8],
-        config: Config,
-        loader: Arc<BuiltInProgram<C>>,
-    ) -> Result<Self, EbpfError> {
-        let executable = Executable::load(config, elf_bytes, loader)?;
+    pub fn from_elf(elf_bytes: &[u8], loader: Arc<BuiltInProgram<C>>) -> Result<Self, EbpfError> {
+        let executable = Executable::load(elf_bytes, loader)?;
         Ok(executable)
     }
     /// Creates an executable from machine code
     pub fn from_text_bytes(
         text_bytes: &[u8],
-        config: Config,
         loader: Arc<BuiltInProgram<C>>,
         function_registry: FunctionRegistry,
     ) -> Result<Self, EbpfError> {
-        Executable::new_from_text_bytes(config, text_bytes, loader, function_registry)
+        Executable::new_from_text_bytes(text_bytes, loader, function_registry)
             .map_err(EbpfError::ElfError)
     }
 }
@@ -479,10 +482,9 @@ pub struct RuntimeEnvironment<'a, C: ContextObject> {
 ///     0xaa, 0xbb, 0x11, 0x22, 0xcc, 0xdd
 /// ];
 ///
-/// let config = Config::default();
-/// let loader = std::sync::Arc::new(BuiltInProgram::default());
+/// let loader = std::sync::Arc::new(BuiltInProgram::new_loader(Config::default()));
 /// let function_registry = FunctionRegistry::default();
-/// let mut executable = Executable::<TestContextObject>::from_text_bytes(prog, config, loader, function_registry).unwrap();
+/// let mut executable = Executable::<TestContextObject>::from_text_bytes(prog, loader, function_registry).unwrap();
 /// let mem_region = MemoryRegion::new_writable(mem, ebpf::MM_INPUT_START);
 /// let verified_executable = VerifiedExecutable::<RequisiteVerifier, TestContextObject>::from_executable(executable).unwrap();
 /// let mut context_object = TestContextObject::new(1);
