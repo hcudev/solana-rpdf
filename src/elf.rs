@@ -141,7 +141,8 @@ pub fn register_internal_function<
         pc as u32
     } else {
         let hash = hash_internal_function(pc, name.as_ref());
-        if config.syscall_internal_function_hash_collision && loader.lookup_function(hash).is_some()
+        if config.external_internal_function_hash_collision
+            && loader.lookup_function(hash).is_some()
         {
             return Err(ElfError::SymbolHashCollision(hash));
         }
@@ -279,7 +280,7 @@ pub struct Executable<C: ContextObject> {
     loader: Arc<BuiltInProgram<C>>,
     /// Compiled program and argument
     #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
-    compiled_program: Option<JitProgram<C>>,
+    compiled_program: Option<JitProgram>,
 }
 
 impl<C: ContextObject> Executable<C> {
@@ -346,7 +347,7 @@ impl<C: ContextObject> Executable<C> {
 
     /// Get the JIT compiled program
     #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
-    pub fn get_compiled_program(&self) -> Option<&JitProgram<C>> {
+    pub fn get_compiled_program(&self) -> Option<&JitProgram> {
         self.compiled_program.as_ref()
     }
 
