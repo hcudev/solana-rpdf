@@ -1,11 +1,18 @@
 //! This module defines memory regions
 
 use crate::{
+    aligned_memory::Pod,
     ebpf,
     error::EbpfError,
     vm::{Config, ProgramResult},
 };
-use std::{array, cell::UnsafeCell, fmt, ops::Range};
+use std::{
+    array,
+    cell::UnsafeCell,
+    fmt, mem,
+    ops::Range,
+    ptr::{self, copy_nonoverlapping},
+};
 
 /* Explaination of the Gapped Memory
 
@@ -32,6 +39,8 @@ pub struct MemoryRegion {
     pub host_addr: u64,
     /// start virtual address
     pub vm_addr: u64,
+    /// end virtual address
+    pub vm_addr_end: u64,
     /// Length in bytes
     pub len: u64,
     /// Size of regular gaps as bit shift (63 means this region is continuous)
@@ -52,6 +61,7 @@ impl MemoryRegion {
         MemoryRegion {
             host_addr: slice.as_ptr() as u64,
             vm_addr,
+            vm_addr_end: vm_addr.saturating_add(slice.len() as u64),
             len: slice.len() as u64,
             vm_gap_shift,
             is_writable,
@@ -201,17 +211,13 @@ impl<'a> UnalignedMemoryMapping<'a> {
         Ok(result)
     }
 
-    /// Given a list of regions translate from virtual machine to host address
     #[allow(clippy::integer_arithmetic)]
-    pub fn map(&self, access_type: AccessType, vm_addr: u64, len: u64, pc: usize) -> ProgramResult {
-        // Safety:
-        // &mut references to the mapping cache are only created internally here
-        // and in replace_region(). The methods never invoke each other and
-        // UnalignedMemoryMapping is !Sync, so the cache reference below is
-        // guaranteed to be unique.
-        let cache = unsafe { &mut *self.cache.get() };
-        let (cache_miss, index) = if let Some(region) = cache.find(vm_addr) {
-            (false, region)
+    fn find_region(&self, cache: &mut MappingCache, vm_addr: u64) -> Option<&MemoryRegion> {
+        if let Some(index) = cache.find(vm_addr) {
+            // Safety:
+            // Cached index, we validated it before caching it. See the corresponding safety section
+            // in the miss branch.
+            Some(unsafe { self.regions.get_unchecked(index - 1) })
         } else {
             let mut index = 1;
             while index <= self.region_addresses.len() {
@@ -224,28 +230,195 @@ impl<'a> UnalignedMemoryMapping<'a> {
             }
             index >>= index.trailing_zeros() + 1;
             if index == 0 {
-                return generate_access_violation(self.config, access_type, vm_addr, len, pc);
+                return None;
             }
-            (true, index)
+            // Safety:
+            // we check for index==0 above, and by construction if we get here index
+            // must be contained in region
+            let region = unsafe { self.regions.get_unchecked(index - 1) };
+            cache.insert(
+                region.vm_addr..region.vm_addr.saturating_add(region.len),
+                index,
+            );
+            Some(region)
+        }
+    }
+
+    /// Given a list of regions translate from virtual machine to host address
+    pub fn map(&self, access_type: AccessType, vm_addr: u64, len: u64, pc: usize) -> ProgramResult {
+        // Safety:
+        // &mut references to the mapping cache are only created internally from methods that do not
+        // invoke each other. UnalignedMemoryMapping is !Sync, so the cache reference below is
+        // guaranteed to be unique.
+        let cache = unsafe { &mut *self.cache.get() };
+
+        let region = match self.find_region(cache, vm_addr) {
+            Some(res) => res,
+            None => return generate_access_violation(self.config, access_type, vm_addr, len, pc),
         };
 
-        // Safety:
-        // we check for index==0 above, and by construction if we get here index
-        // must be contained in region
-        let region = unsafe { self.regions.get_unchecked(index - 1) };
         if access_type == AccessType::Load || region.is_writable {
             if let ProgramResult::Ok(host_addr) = region.vm_to_host(vm_addr, len) {
-                if cache_miss {
-                    cache.insert(
-                        region.vm_addr..region.vm_addr.saturating_add(region.len),
-                        index,
-                    );
-                }
                 return ProgramResult::Ok(host_addr);
             }
         }
 
         generate_access_violation(self.config, access_type, vm_addr, len, pc)
+    }
+
+    /// Loads `size_of::<T>()` bytes from the given address.
+    ///
+    /// See [MemoryMapping::load].
+    #[inline(always)]
+    pub fn load<T: Pod + Into<u64>>(&self, mut vm_addr: u64, pc: usize) -> ProgramResult {
+        let mut len = mem::size_of::<T>() as u64;
+        debug_assert!(len <= mem::size_of::<u64>() as u64);
+
+        // Safety:
+        // &mut references to the mapping cache are only created internally from methods that do not
+        // invoke each other. UnalignedMemoryMapping is !Sync, so the cache reference below is
+        // guaranteed to be unique.
+        let cache = unsafe { &mut *self.cache.get() };
+
+        let mut region = match self.find_region(cache, vm_addr) {
+            Some(region) => {
+                if let ProgramResult::Ok(host_addr) = region.vm_to_host(vm_addr, len) {
+                    // fast path
+                    return ProgramResult::Ok(unsafe {
+                        ptr::read_unaligned::<T>(host_addr as *const _).into()
+                    });
+                }
+
+                region
+            }
+            None => {
+                return generate_access_violation(self.config, AccessType::Load, vm_addr, len, pc)
+            }
+        };
+
+        // slow path
+        let initial_len = len;
+        let initial_vm_addr = vm_addr;
+        let mut value = 0u64;
+        let mut ptr = &mut value as *mut _ as *mut u8;
+
+        while len > 0 {
+            let load_len = len.min(region.vm_addr_end.saturating_sub(vm_addr));
+            if let ProgramResult::Ok(host_addr) = region.vm_to_host(vm_addr, load_len) {
+                // Safety:
+                // we debug_assert!(len <= mem::size_of::<u64>()) so we never
+                // overflow &value
+                unsafe {
+                    copy_nonoverlapping(host_addr as *const _, ptr, load_len as usize);
+                    ptr = ptr.add(load_len as usize);
+                };
+                len = len.saturating_sub(load_len);
+                if len == 0 {
+                    return ProgramResult::Ok(value);
+                }
+                vm_addr = vm_addr.saturating_add(load_len);
+                region = match self.find_region(cache, vm_addr) {
+                    Some(region) => region,
+                    None => break,
+                };
+            }
+        }
+
+        generate_access_violation(
+            self.config,
+            AccessType::Load,
+            initial_vm_addr,
+            initial_len,
+            pc,
+        )
+    }
+
+    /// Store `value` at the given address.
+    ///
+    /// See [MemoryMapping::store].
+    #[inline]
+    pub fn store<T: Pod>(&self, value: T, mut vm_addr: u64, pc: usize) -> ProgramResult {
+        let mut len = mem::size_of::<T>() as u64;
+
+        // Safety:
+        // &mut references to the mapping cache are only created internally from methods that do not
+        // invoke each other. UnalignedMemoryMapping is !Sync, so the cache reference below is
+        // guaranteed to be unique.
+        let cache = unsafe { &mut *self.cache.get() };
+
+        let mut src = &value as *const _ as *const u8;
+
+        let mut region = match self.find_region(cache, vm_addr) {
+            Some(region) if region.is_writable => {
+                // fast path
+                if let ProgramResult::Ok(host_addr) = region.vm_to_host(vm_addr, len) {
+                    // Safety:
+                    // vm_to_host() succeeded so we know there's enough space to
+                    // store `value`
+                    unsafe { ptr::write_unaligned(host_addr as *mut _, value) };
+                    return ProgramResult::Ok(host_addr);
+                }
+                region
+            }
+            _ => {
+                return generate_access_violation(self.config, AccessType::Store, vm_addr, len, pc)
+            }
+        };
+
+        // slow path
+        let initial_len = len;
+        let initial_vm_addr = vm_addr;
+
+        while len > 0 {
+            if !region.is_writable {
+                break;
+            }
+            let write_len = len.min(region.vm_addr_end.saturating_sub(vm_addr));
+            if let ProgramResult::Ok(host_addr) = region.vm_to_host(vm_addr, write_len) {
+                // Safety:
+                // vm_to_host() succeeded so we have enough space for write_len
+                unsafe { copy_nonoverlapping(src, host_addr as *mut _, write_len as usize) };
+                len = len.saturating_sub(write_len);
+                if len == 0 {
+                    return ProgramResult::Ok(host_addr);
+                }
+                src = unsafe { src.add(write_len as usize) };
+                vm_addr = vm_addr.saturating_add(write_len);
+                region = match self.find_region(cache, vm_addr) {
+                    Some(region) => region,
+                    None => break,
+                };
+            }
+        }
+
+        generate_access_violation(
+            self.config,
+            AccessType::Store,
+            initial_vm_addr,
+            initial_len,
+            pc,
+        )
+    }
+
+    /// Returns the `MemoryRegion` corresponding to the given address.
+    pub fn region(
+        &self,
+        access_type: AccessType,
+        vm_addr: u64,
+    ) -> Result<&MemoryRegion, EbpfError> {
+        // Safety:
+        // &mut references to the mapping cache are only created internally from methods that do not
+        // invoke each other. UnalignedMemoryMapping is !Sync, so the cache reference below is
+        // guaranteed to be unique.
+        let cache = unsafe { &mut *self.cache.get() };
+        if let Some(region) = self.find_region(cache, vm_addr) {
+            if (region.vm_addr..region.vm_addr_end).contains(&vm_addr)
+                && (access_type == AccessType::Load || region.is_writable)
+            {
+                return Ok(region);
+            }
+        }
+        Err(generate_access_violation(self.config, access_type, vm_addr, 0, 0).unwrap_err())
     }
 
     /// Returns the `MemoryRegion`s in this mapping
@@ -311,6 +484,62 @@ impl<'a> AlignedMemoryMapping<'a> {
         generate_access_violation(self.config, access_type, vm_addr, len, pc)
     }
 
+    /// Loads `size_of::<T>()` bytes from the given address.
+    ///
+    /// See [MemoryMapping::load].
+    #[inline]
+    pub fn load<T: Pod + Into<u64>>(&self, vm_addr: u64, pc: usize) -> ProgramResult {
+        let len = mem::size_of::<T>() as u64;
+        match self.map(AccessType::Load, vm_addr, len, pc) {
+            ProgramResult::Ok(host_addr) => {
+                ProgramResult::Ok(unsafe { ptr::read_unaligned::<T>(host_addr as *const _) }.into())
+            }
+            err => err,
+        }
+    }
+
+    /// Store `value` at the given address.
+    ///
+    /// See [MemoryMapping::store].
+    #[inline]
+    pub fn store<T: Pod>(&self, value: T, vm_addr: u64, pc: usize) -> ProgramResult {
+        let len = mem::size_of::<T>() as u64;
+        debug_assert!(len <= mem::size_of::<u64>() as u64);
+
+        match self.map(AccessType::Store, vm_addr, len, pc) {
+            ProgramResult::Ok(host_addr) => {
+                // Safety:
+                // map succeeded so we can write at least `len` bytes
+                unsafe {
+                    ptr::write_unaligned(host_addr as *mut T, value);
+                }
+                ProgramResult::Ok(host_addr)
+            }
+
+            err => err,
+        }
+    }
+
+    /// Returns the `MemoryRegion` corresponding to the given address.
+    pub fn region(
+        &self,
+        access_type: AccessType,
+        vm_addr: u64,
+    ) -> Result<&MemoryRegion, EbpfError> {
+        let index = vm_addr
+            .checked_shr(ebpf::VIRTUAL_ADDRESS_BITS as u32)
+            .unwrap_or(0) as usize;
+        if (1..self.regions.len()).contains(&index) {
+            let region = &self.regions[index];
+            if (region.vm_addr..region.vm_addr_end).contains(&vm_addr)
+                && (access_type == AccessType::Load || region.is_writable)
+            {
+                return Ok(region);
+            }
+        }
+        Err(generate_access_violation(self.config, access_type, vm_addr, 0, 0).unwrap_err())
+    }
+
     /// Returns the `MemoryRegion`s in this mapping
     pub fn get_regions(&self) -> &[MemoryRegion] {
         &self.regions
@@ -366,6 +595,40 @@ impl<'a> MemoryMapping<'a> {
         match self {
             MemoryMapping::Aligned(m) => m.map(access_type, vm_addr, len, pc),
             MemoryMapping::Unaligned(m) => m.map(access_type, vm_addr, len, pc),
+        }
+    }
+
+    /// Loads `size_of::<T>()` bytes from the given address.
+    ///
+    /// Works across memory region boundaries.
+    #[inline]
+    pub fn load<T: Pod + Into<u64>>(&self, vm_addr: u64, pc: usize) -> ProgramResult {
+        match self {
+            MemoryMapping::Aligned(m) => m.load::<T>(vm_addr, pc),
+            MemoryMapping::Unaligned(m) => m.load::<T>(vm_addr, pc),
+        }
+    }
+
+    /// Store `value` at the given address.
+    ///
+    /// Works across memory region boundaries if `len` does not fit within a single region.
+    #[inline]
+    pub fn store<T: Pod>(&self, value: T, vm_addr: u64, pc: usize) -> ProgramResult {
+        match self {
+            MemoryMapping::Aligned(m) => m.store(value, vm_addr, pc),
+            MemoryMapping::Unaligned(m) => m.store(value, vm_addr, pc),
+        }
+    }
+
+    /// Returns the `MemoryRegion` corresponding to the given address.
+    pub fn region(
+        &self,
+        access_type: AccessType,
+        vm_addr: u64,
+    ) -> Result<&MemoryRegion, EbpfError> {
+        match self {
+            MemoryMapping::Aligned(m) => m.region(access_type, vm_addr),
+            MemoryMapping::Unaligned(m) => m.region(access_type, vm_addr),
         }
     }
 
@@ -655,6 +918,110 @@ mod test {
             ),
             ProgramResult::Err(EbpfError::AccessViolation(..))
         ));
+    }
+
+    #[test]
+    fn test_unaligned_map_load() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let mem1 = [0x11, 0x22];
+        let mem2 = [0x33];
+        let mem3 = [0x44, 0x55, 0x66];
+        let mem4 = [0x77, 0x88, 0x99];
+        let m = MemoryMapping::new(
+            vec![
+                MemoryRegion::new_readonly(&mem1, ebpf::MM_INPUT_START),
+                MemoryRegion::new_readonly(&mem2, ebpf::MM_INPUT_START + mem1.len() as u64),
+                MemoryRegion::new_readonly(
+                    &mem3,
+                    ebpf::MM_INPUT_START + (mem1.len() + mem2.len()) as u64,
+                ),
+                MemoryRegion::new_readonly(
+                    &mem4,
+                    ebpf::MM_INPUT_START + (mem1.len() + mem2.len() + mem3.len()) as u64,
+                ),
+            ],
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(m.load::<u16>(ebpf::MM_INPUT_START, 0).unwrap(), 0x2211);
+        assert_eq!(m.load::<u32>(ebpf::MM_INPUT_START, 0).unwrap(), 0x44332211);
+        assert_eq!(
+            m.load::<u64>(ebpf::MM_INPUT_START, 0).unwrap(),
+            0x8877665544332211
+        );
+        assert_eq!(m.load::<u16>(ebpf::MM_INPUT_START + 1, 0).unwrap(), 0x3322);
+        assert_eq!(
+            m.load::<u32>(ebpf::MM_INPUT_START + 1, 0).unwrap(),
+            0x55443322
+        );
+        assert_eq!(
+            m.load::<u64>(ebpf::MM_INPUT_START + 1, 0).unwrap(),
+            0x9988776655443322
+        );
+    }
+
+    #[test]
+    fn test_unaligned_map_store() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let mut mem1 = vec![0xff, 0xff];
+        let mut mem2 = vec![0xff];
+        let mut mem3 = vec![0xff, 0xff, 0xff];
+        let mut mem4 = vec![0xff, 0xff];
+        let m = MemoryMapping::new(
+            vec![
+                MemoryRegion::new_writable(&mut mem1, ebpf::MM_INPUT_START),
+                MemoryRegion::new_writable(&mut mem2, ebpf::MM_INPUT_START + mem1.len() as u64),
+                MemoryRegion::new_writable(
+                    &mut mem3,
+                    ebpf::MM_INPUT_START + (mem1.len() + mem2.len()) as u64,
+                ),
+                MemoryRegion::new_writable(
+                    &mut mem4,
+                    ebpf::MM_INPUT_START + (mem1.len() + mem2.len() + mem3.len()) as u64,
+                ),
+            ],
+            &config,
+        )
+        .unwrap();
+        m.store(0x1122u16, ebpf::MM_INPUT_START, 0).unwrap();
+        assert_eq!(m.load::<u16>(ebpf::MM_INPUT_START, 0).unwrap(), 0x1122);
+
+        m.store(0x33445566u32, ebpf::MM_INPUT_START, 0).unwrap();
+        assert_eq!(m.load::<u32>(ebpf::MM_INPUT_START, 0).unwrap(), 0x33445566);
+
+        m.store(0x778899AABBCCDDEEu64, ebpf::MM_INPUT_START, 0)
+            .unwrap();
+        assert_eq!(
+            m.load::<u64>(ebpf::MM_INPUT_START, 0).unwrap(),
+            0x778899AABBCCDDEE
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "AccessViolation")]
+    fn test_store_readonly() {
+        let config = Config {
+            aligned_memory_mapping: false,
+            ..Config::default()
+        };
+        let mut mem1 = vec![0xff, 0xff];
+        let mem2 = vec![0xff, 0xff];
+        let m = MemoryMapping::new(
+            vec![
+                MemoryRegion::new_writable(&mut mem1, ebpf::MM_INPUT_START),
+                MemoryRegion::new_readonly(&mem2, ebpf::MM_INPUT_START + mem1.len() as u64),
+            ],
+            &config,
+        )
+        .unwrap();
+        m.store(0x11223344, ebpf::MM_INPUT_START, 0).unwrap();
     }
 
     #[test]
