@@ -93,7 +93,7 @@ impl<T, E> From<Result<T, E>> for StableResult<T, E> {
 }
 
 /// Return value of programs and syscalls
-pub type ProgramResult = StableResult<u64, EbpfError>;
+pub type ProgramResult = StableResult<u64, Box<dyn std::error::Error>>;
 
 /// Holds the function symbols of an Executable
 pub type FunctionRegistry = BTreeMap<u32, (usize, String)>;
@@ -516,7 +516,7 @@ pub struct RuntimeEnvironment<'a, C: ContextObject> {
 ///
 /// let memory_mapping = MemoryMapping::new(regions, config).unwrap();
 ///
-/// let mut vm = EbpfVm::new(&verified_executable, &mut context_object, memory_mapping, stack_len).unwrap();
+/// let mut vm = EbpfVm::new(&verified_executable, &mut context_object, memory_mapping, stack_len);
 ///
 /// let (instruction_count, result) = vm.execute_program(true);
 /// assert_eq!(instruction_count, 1);
@@ -538,7 +538,7 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
         context_object: &'a mut C,
         memory_mapping: MemoryMapping<'a>,
         stack_len: usize,
-    ) -> Result<EbpfVm<'a, V, C>, EbpfError> {
+    ) -> EbpfVm<'a, V, C> {
         let executable = verified_executable.get_executable();
         let config = executable.get_config();
         let stack_pointer = ebpf::MM_STACK_START.saturating_add(if config.dynamic_stack_frames {
@@ -548,7 +548,7 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
             // within a frame the stack grows down, but frames are ascending
             config.stack_frame_size
         } as u64);
-        let vm = EbpfVm {
+        EbpfVm {
             verified_executable,
             #[cfg(feature = "debugger")]
             debug_port: None,
@@ -564,8 +564,7 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
                 memory_mapping,
                 call_frames: vec![CallFrame::default(); config.max_call_depth],
             },
-        };
-        Ok(vm)
+        }
     }
 
     /// Execute the program
@@ -604,7 +603,7 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
             {
                 let compiled_program = match executable
                     .get_compiled_program()
-                    .ok_or(EbpfError::JitNotCompiled)
+                    .ok_or_else(|| Box::new(EbpfError::JitNotCompiled))
                 {
                     Ok(compiled_program) => compiled_program,
                     Err(error) => return (0, ProgramResult::Err(error)),
@@ -619,7 +618,7 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
             }
             #[cfg(not(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64")))]
             {
-                return (0, ProgramResult::Err(EbpfError::JitNotCompiled));
+                return (0, ProgramResult::Err(Box::new(EbpfError::JitNotCompiled)));
             }
         };
         let instruction_count = if config.enable_instruction_meter {
@@ -628,11 +627,12 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
         } else {
             0
         };
-        if let ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, _)) =
-            self.env.program_result
-        {
-            self.env.program_result =
-                ProgramResult::Err(EbpfError::ExceededMaxInstructions(pc, initial_insn_count));
+        if let ProgramResult::Err(err) = &mut self.env.program_result {
+            if let Some(EbpfError::ExceededMaxInstructions(_pc, insn_count)) =
+                err.downcast_mut::<EbpfError>()
+            {
+                *insn_count = initial_insn_count;
+            }
         }
         let mut result = ProgramResult::Ok(0);
         std::mem::swap(&mut result, &mut self.env.program_result);
@@ -648,7 +648,7 @@ mod tests {
     fn test_program_result_is_stable() {
         let ok = ProgramResult::Ok(42);
         assert_eq!(unsafe { *(&ok as *const _ as *const u64) }, 0);
-        let err = ProgramResult::Err(EbpfError::JitNotCompiled);
+        let err = ProgramResult::Err(Box::new(EbpfError::JitNotCompiled));
         assert_eq!(unsafe { *(&err as *const _ as *const u64) }, 1);
     }
 }
