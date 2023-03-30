@@ -230,12 +230,28 @@ fn test_verifier_err_jmp_lddw() {
 }
 
 #[test]
-#[should_panic(expected = "JumpToMiddleOfLDDW(2, 31)")]
+#[should_panic(expected = "InvalidFunction(1)")]
 fn test_verifier_err_call_lddw() {
     let executable = assemble::<TestContextObject>(
         "
         call 1
         lddw r0, 0x1122334455667788
+        exit",
+        Arc::new(BuiltInProgram::new_loader(Config::default())),
+    )
+    .unwrap();
+    let _verified_executable =
+        VerifiedExecutable::<RequisiteVerifier, TestContextObject>::from_executable(executable)
+            .unwrap();
+}
+
+#[test]
+#[should_panic(expected = "InvalidFunction(0)")]
+fn test_verifier_err_function_fallthrough() {
+    let executable = assemble::<TestContextObject>(
+        "
+        mov r0, r1
+        function_foo:
         exit",
         Arc::new(BuiltInProgram::new_loader(Config::default())),
     )

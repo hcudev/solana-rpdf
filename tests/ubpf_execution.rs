@@ -3189,15 +3189,16 @@ fn test_tight_infinite_recursion_callx() {
         "
         mov64 r8, 0x1
         lsh64 r8, 0x20
-        or64 r8, 0x18
+        or64 r8, 0x20
+        call function_foo
         function_foo:
         mov64 r3, 0x41414141
         callx r8
         exit",
         [],
         (),
-        TestContextObject::new(7),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(34, 7))),
+        TestContextObject::new(8),
+        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(35, 8))),
     );
 }
 
@@ -3327,8 +3328,8 @@ fn test_err_capped_before_exception() {
         exit",
         [],
         (),
-        TestContextObject::new(2),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(31, 2))),
+        TestContextObject::new(4),
+        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(33, 4))),
     );
     test_interpreter_and_jit_asm!(
         "

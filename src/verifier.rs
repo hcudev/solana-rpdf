@@ -80,6 +80,9 @@ pub enum VerifierError {
     /// Invalid register specified
     #[error("Invalid register specified at instruction {0}")]
     InvalidRegister(usize),
+    /// Invalid function
+    #[error("Invalid function at instruction {0}")]
+    InvalidFunction(usize),
 }
 
 /// eBPF Verifier
@@ -141,11 +144,15 @@ fn check_load_dw(prog: &[u8], insn_ptr: usize) -> Result<(), VerifierError> {
     Ok(())
 }
 
-fn check_jmp_offset(prog: &[u8], insn_ptr: usize) -> Result<(), VerifierError> {
+fn check_jmp_offset(
+    prog: &[u8],
+    insn_ptr: usize,
+    function_range: &std::ops::Range<usize>,
+) -> Result<(), VerifierError> {
     let insn = ebpf::get_insn(prog, insn_ptr);
 
     let dst_insn_ptr = insn_ptr as isize + 1 + insn.off as isize;
-    if dst_insn_ptr < 0 || dst_insn_ptr as usize * ebpf::INSN_SIZE >= prog.len() {
+    if dst_insn_ptr < 0 || !function_range.contains(&(dst_insn_ptr as usize)) {
         return Err(VerifierError::JumpOutOfCode(
             dst_insn_ptr as usize,
             adj_insn_ptr(insn_ptr),
@@ -219,22 +226,30 @@ impl Verifier for RequisiteVerifier {
     fn verify(prog: &[u8], config: &Config, function_registry: &FunctionRegistry) -> Result<(), VerifierError> {
         check_prog_len(prog)?;
 
-        if config.static_syscalls {
-            for (_key, (dst_insn_ptr, _name)) in function_registry.iter() {
-                let dst_insn = ebpf::get_insn(prog, *dst_insn_ptr);
-                if dst_insn.opc == 0 {
-                    return Err(VerifierError::JumpToMiddleOfLDDW(
-                        *dst_insn_ptr,
-                        adj_insn_ptr(*dst_insn_ptr),
-                    ));
-                }
-            }
-        }
-
+        let program_range = 0..prog.len() / ebpf::INSN_SIZE;
+        let mut function_iter = function_registry.keys().map(|insn_ptr| *insn_ptr as usize).peekable();
+        let mut function_range = program_range.start..program_range.end;
         let mut insn_ptr: usize = 0;
         while (insn_ptr + 1) * ebpf::INSN_SIZE <= prog.len() {
             let insn = ebpf::get_insn(prog, insn_ptr);
             let mut store = false;
+
+            if config.static_syscalls && function_iter.peek() == Some(&insn_ptr) {
+                function_range.start = function_iter.next().unwrap_or(0);
+                function_range.end = *function_iter.peek().unwrap_or(&program_range.end);
+                if insn.opc == 0 {
+                    return Err(VerifierError::InvalidFunction(
+                        function_range.start,
+                    ));
+                }
+                let insn = ebpf::get_insn(prog, function_range.end.saturating_sub(1));
+                match insn.opc {
+                    ebpf::JA | ebpf::CALL_IMM | ebpf::CALL_REG | ebpf::EXIT => {},
+                    _ => return Err(VerifierError::InvalidFunction(
+                        function_range.end.saturating_sub(1),
+                    )),
+                }
+            }
 
             match insn.opc {
                 ebpf::LD_DW_IMM  => {
@@ -321,29 +336,30 @@ impl Verifier for RequisiteVerifier {
                 ebpf::ARSH64_REG => {},
 
                 // BPF_JMP class
-                ebpf::JA         => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JEQ_IMM    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JEQ_REG    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JGT_IMM    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JGT_REG    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JGE_IMM    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JGE_REG    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JLT_IMM    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JLT_REG    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JLE_IMM    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JLE_REG    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JSET_IMM   => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JSET_REG   => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JNE_IMM    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JNE_REG    => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JSGT_IMM   => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JSGT_REG   => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JSGE_IMM   => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JSGE_REG   => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JSLT_IMM   => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JSLT_REG   => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JSLE_IMM   => { check_jmp_offset(prog, insn_ptr)?; },
-                ebpf::JSLE_REG   => { check_jmp_offset(prog, insn_ptr)?; },
+                ebpf::JA         => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JEQ_IMM    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JEQ_REG    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JGT_IMM    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JGT_REG    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JGE_IMM    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JGE_REG    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JLT_IMM    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JLT_REG    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JLE_IMM    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JLE_REG    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JSET_IMM   => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JSET_REG   => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JNE_IMM    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JNE_REG    => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JSGT_IMM   => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JSGT_REG   => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JSGE_IMM   => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JSGE_REG   => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JSLT_IMM   => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JSLT_REG   => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JSLE_IMM   => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::JSLE_REG   => { check_jmp_offset(prog, insn_ptr, &function_range)?; },
+                ebpf::CALL_IMM   if config.static_syscalls && insn.src != 0 => { check_jmp_offset(prog, insn_ptr, &program_range)?; },
                 ebpf::CALL_IMM   => {},
                 ebpf::CALL_REG   => { check_imm_register(&insn, insn_ptr, config)?; },
                 ebpf::EXIT       => {},
