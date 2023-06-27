@@ -6,7 +6,7 @@
 
 extern crate solana_rbpf;
 use solana_rbpf::{
-    elf::Executable,
+    elf::{Executable, SBPFVersion},
     static_analysis::Analysis,
     verifier::TautologyVerifier,
     vm::{BuiltinProgram, FunctionRegistry, TestContextObject},
@@ -35,6 +35,7 @@ fn main() {
     let executable = Executable::<TautologyVerifier, TestContextObject>::from_text_bytes(
         program,
         loader,
+        SBPFVersion::V2,
         FunctionRegistry::default(),
     )
     .unwrap();

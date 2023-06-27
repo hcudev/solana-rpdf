@@ -8,9 +8,12 @@
 //! Functions in this module are used to handle eBPF programs with a higher level representation,
 //! for example to disassemble the code into a human-readable format.
 
-use crate::ebpf;
-use crate::static_analysis::CfgNode;
-use crate::vm::{BuiltinProgram, ContextObject, FunctionRegistry};
+use crate::{
+    ebpf,
+    elf::SBPFVersion,
+    static_analysis::CfgNode,
+    vm::{BuiltinProgram, ContextObject, FunctionRegistry},
+};
 use std::collections::BTreeMap;
 
 fn resolve_label(cfg_nodes: &BTreeMap<usize, CfgNode>, pc: usize) -> &str {
@@ -122,6 +125,7 @@ pub fn disassemble_instruction<C: ContextObject>(
     cfg_nodes: &BTreeMap<usize, CfgNode>,
     function_registry: &FunctionRegistry,
     loader: &BuiltinProgram<C>,
+    sbpf_version: &SBPFVersion,
 ) -> String {
     let name;
     let desc;
@@ -248,7 +252,7 @@ pub fn disassemble_instruction<C: ContextObject>(
         ebpf::JSLE_REG   => { name = "jsle"; desc = jmp_reg_str(name, insn, cfg_nodes); },
         ebpf::CALL_IMM   => {
             let mut function_name = None;
-            if loader.get_config().static_syscalls {
+            if sbpf_version.static_syscalls() {
                 if insn.src != 0 {
                     function_name = Some(resolve_label(cfg_nodes, insn.imm as usize));
                 }
