@@ -22,7 +22,7 @@ use crate::{
     },
     memory_region::{AccessType, MemoryMapping},
     verifier::Verifier,
-    vm::{Config, ContextObject, ProgramResult, RuntimeEnvironment},
+    vm::{Config, ContextObject, EbpfVm, ProgramResult},
     x86::*,
 };
 
@@ -93,12 +93,12 @@ impl JitProgram {
     pub fn invoke<C: ContextObject>(
         &self,
         config: &Config,
-        env: &mut RuntimeEnvironment<C>,
+        vm: &mut EbpfVm<C>,
         registers: [u64; 12],
     ) -> i64 {
         unsafe {
             let mut instruction_meter =
-                (env.previous_instruction_meter as i64).wrapping_add(registers[11] as i64);
+                (vm.previous_instruction_meter as i64).wrapping_add(registers[11] as i64);
             std::arch::asm!(
                 // RBP and RBX must be saved and restored manually in the current version of rustc and llvm.
                 "push rbx",
@@ -121,8 +121,8 @@ impl JitProgram {
                 "call r10",
                 "pop rbp",
                 "pop rbx",
-                host_stack_pointer = in(reg) &mut env.host_stack_pointer,
-                rbp = in(reg) (env as *mut _ as *mut u64).offset(config.runtime_environment_key as isize),
+                host_stack_pointer = in(reg) &mut vm.host_stack_pointer,
+                rbp = in(reg) (vm as *mut _ as *mut u64).offset(config.runtime_environment_key as isize),
                 rbx = in(reg) registers[ebpf::FRAME_PTR_REG],
                 inlateout("rdi") instruction_meter,
                 inlateout("r10") self.pc_section[registers[11] as usize] => _,
@@ -1562,20 +1562,15 @@ mod tests {
 
     #[test]
     fn test_runtime_environment_slots() {
+        let executable = create_mockup_executable(&[]);
         let mut context_object = TestContextObject::new(0);
-        let config = Config::default();
-        let env = RuntimeEnvironment {
-            host_stack_pointer: std::ptr::null_mut(),
-            call_depth: 0,
-            stack_pointer: 0,
-            context_object_pointer: &mut context_object,
-            previous_instruction_meter: 0,
-            stopwatch_numerator: 0,
-            stopwatch_denominator: 0,
-            program_result: ProgramResult::Ok(0),
-            memory_mapping: MemoryMapping::new(Vec::new(), &config, &SBPFVersion::V2).unwrap(),
-            call_frames: Vec::new(),
-        };
+        let env = EbpfVm::new(
+            executable.get_config(),
+            executable.get_sbpf_version(),
+            &mut context_object,
+            MemoryMapping::new_identity(),
+            0,
+        );
 
         macro_rules! check_slot {
             ($env:expr, $entry:ident, $slot:ident) => {

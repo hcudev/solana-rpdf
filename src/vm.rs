@@ -393,10 +393,59 @@ pub struct CallFrame {
     pub target_pc: usize,
 }
 
-/// Runtime state
-// Keep changes here in sync with RuntimeEnvironmentSlot
+/// A virtual machine to run eBPF programs.
+///
+/// # Examples
+///
+/// ```
+/// use solana_rbpf::{
+///     aligned_memory::AlignedMemory,
+///     ebpf,
+///     elf::{Executable, SBPFVersion},
+///     memory_region::{MemoryMapping, MemoryRegion},
+///     verifier::{TautologyVerifier, RequisiteVerifier},
+///     vm::{BuiltinProgram, Config, EbpfVm, FunctionRegistry, TestContextObject},
+/// };
+///
+/// let prog = &[
+///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
+/// ];
+/// let mem = &mut [
+///     0xaa, 0xbb, 0x11, 0x22, 0xcc, 0xdd
+/// ];
+///
+/// let loader = std::sync::Arc::new(BuiltinProgram::new_loader(Config::default()));
+/// let function_registry = FunctionRegistry::default();
+/// let mut executable = Executable::<TautologyVerifier, TestContextObject>::from_text_bytes(prog, loader, SBPFVersion::V2, function_registry).unwrap();
+/// let verified_executable = Executable::<RequisiteVerifier, TestContextObject>::verified(executable).unwrap();
+/// let mut context_object = TestContextObject::new(1);
+/// let config = verified_executable.get_config();
+/// let sbpf_version = verified_executable.get_sbpf_version();
+///
+/// let mut stack = AlignedMemory::<{ebpf::HOST_ALIGN}>::zero_filled(config.stack_size());
+/// let stack_len = stack.len();
+/// let mut heap = AlignedMemory::<{ebpf::HOST_ALIGN}>::with_capacity(0);
+///
+/// let regions: Vec<MemoryRegion> = vec![
+///     verified_executable.get_ro_region(),
+///     MemoryRegion::new_writable(
+///         stack.as_slice_mut(),
+///         ebpf::MM_STACK_START,
+///     ),
+///     MemoryRegion::new_writable(heap.as_slice_mut(), ebpf::MM_HEAP_START),
+///     MemoryRegion::new_writable(mem, ebpf::MM_INPUT_START),
+/// ];
+///
+/// let memory_mapping = MemoryMapping::new(regions, config, sbpf_version).unwrap();
+///
+/// let mut vm = EbpfVm::new(config, sbpf_version, &mut context_object, memory_mapping, stack_len);
+///
+/// let (instruction_count, result) = vm.execute_program(&verified_executable, true);
+/// assert_eq!(instruction_count, 1);
+/// assert_eq!(result.unwrap(), 0);
+/// ```
 #[repr(C)]
-pub struct RuntimeEnvironment<'a, C: ContextObject> {
+pub struct EbpfVm<'a, C: ContextObject> {
     /// Needed to exit from the guest back into the host
     pub host_stack_pointer: *mut u64,
     /// The current call depth.
@@ -425,129 +474,72 @@ pub struct RuntimeEnvironment<'a, C: ContextObject> {
     pub memory_mapping: MemoryMapping<'a>,
     /// Stack of CallFrames used by the Interpreter
     pub call_frames: Vec<CallFrame>,
-}
-
-/// A virtual machine to run eBPF programs.
-///
-/// # Examples
-///
-/// ```
-/// use solana_rbpf::{
-///     aligned_memory::AlignedMemory,
-///     ebpf,
-///     elf::{Executable, SBPFVersion},
-///     memory_region::{MemoryMapping, MemoryRegion},
-///     verifier::{TautologyVerifier, RequisiteVerifier},
-///     vm::{BuiltinProgram, Config, EbpfVm, FunctionRegistry, TestContextObject},
-/// };
-///
-/// let prog = &[
-///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
-/// ];
-/// let mem = &mut [
-///     0xaa, 0xbb, 0x11, 0x22, 0xcc, 0xdd
-/// ];
-///
-/// let loader = std::sync::Arc::new(BuiltinProgram::new_loader(Config::default()));
-/// let function_registry = FunctionRegistry::default();
-/// let mut executable = Executable::<TautologyVerifier, TestContextObject>::from_text_bytes(prog, loader, SBPFVersion::V2, function_registry).unwrap();
-/// let verified_executable = Executable::<RequisiteVerifier, TestContextObject>::verified(executable).unwrap();
-/// let mut context_object = TestContextObject::new(1);
-/// let config = verified_executable.get_config();
-///
-/// let mut stack = AlignedMemory::<{ebpf::HOST_ALIGN}>::zero_filled(config.stack_size());
-/// let stack_len = stack.len();
-/// let mut heap = AlignedMemory::<{ebpf::HOST_ALIGN}>::with_capacity(0);
-///
-/// let regions: Vec<MemoryRegion> = vec![
-///     verified_executable.get_ro_region(),
-///     MemoryRegion::new_writable(
-///         stack.as_slice_mut(),
-///         ebpf::MM_STACK_START,
-///     ),
-///     MemoryRegion::new_writable(heap.as_slice_mut(), ebpf::MM_HEAP_START),
-///     MemoryRegion::new_writable(mem, ebpf::MM_INPUT_START),
-/// ];
-///
-/// let memory_mapping = MemoryMapping::new(regions, config, verified_executable.get_sbpf_version()).unwrap();
-///
-/// let mut vm = EbpfVm::new(&verified_executable, &mut context_object, memory_mapping, stack_len);
-///
-/// let (instruction_count, result) = vm.execute_program(true);
-/// assert_eq!(instruction_count, 1);
-/// assert_eq!(result.unwrap(), 0);
-/// ```
-pub struct EbpfVm<'a, V: Verifier, C: ContextObject> {
-    pub(crate) executable: &'a Executable<V, C>,
     /// TCP port for the debugger interface
     #[cfg(feature = "debugger")]
     pub debug_port: Option<u16>,
-    /// Runtime state
-    pub env: RuntimeEnvironment<'a, C>,
 }
 
-impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
+impl<'a, C: ContextObject> EbpfVm<'a, C> {
     /// Creates a new virtual machine instance.
     pub fn new(
-        executable: &'a Executable<V, C>,
+        config: &Config,
+        sbpf_version: &SBPFVersion,
         context_object: &'a mut C,
         mut memory_mapping: MemoryMapping<'a>,
         stack_len: usize,
-    ) -> EbpfVm<'a, V, C> {
-        let config = executable.get_config();
-        let stack_pointer = ebpf::MM_STACK_START.saturating_add(if executable
-            .get_sbpf_version()
-            .dynamic_stack_frames()
-        {
-            // the stack is fully descending, frames start as empty and change size anytime r11 is modified
-            stack_len
-        } else {
-            // within a frame the stack grows down, but frames are ascending
-            config.stack_frame_size
-        } as u64);
+    ) -> Self {
+        let stack_pointer =
+            ebpf::MM_STACK_START.saturating_add(if sbpf_version.dynamic_stack_frames() {
+                // the stack is fully descending, frames start as empty and change size anytime r11 is modified
+                stack_len
+            } else {
+                // within a frame the stack grows down, but frames are ascending
+                config.stack_frame_size
+            } as u64);
         if !config.enable_address_translation {
             memory_mapping = MemoryMapping::new_identity();
         }
         EbpfVm {
-            executable,
+            host_stack_pointer: std::ptr::null_mut(),
+            call_depth: 0,
+            stack_pointer,
+            context_object_pointer: context_object,
+            previous_instruction_meter: 0,
+            stopwatch_numerator: 0,
+            stopwatch_denominator: 0,
+            program_result: ProgramResult::Ok(0),
+            memory_mapping,
+            call_frames: vec![CallFrame::default(); config.max_call_depth],
             #[cfg(feature = "debugger")]
             debug_port: None,
-            env: RuntimeEnvironment {
-                host_stack_pointer: std::ptr::null_mut(),
-                call_depth: 0,
-                stack_pointer,
-                context_object_pointer: context_object,
-                previous_instruction_meter: 0,
-                stopwatch_numerator: 0,
-                stopwatch_denominator: 0,
-                program_result: ProgramResult::Ok(0),
-                memory_mapping,
-                call_frames: vec![CallFrame::default(); config.max_call_depth],
-            },
         }
     }
 
     /// Execute the program
     ///
     /// If interpreted = `false` then the JIT compiled executable is used.
-    pub fn execute_program(&mut self, interpreted: bool) -> (u64, ProgramResult) {
+    pub fn execute_program<V: Verifier>(
+        &mut self,
+        executable: &Executable<V, C>,
+        interpreted: bool,
+    ) -> (u64, ProgramResult) {
         let mut registers = [0u64; 12];
         // R1 points to beginning of input memory, R10 to the stack of the first frame, R11 is the pc (hidden)
         registers[1] = ebpf::MM_INPUT_START;
-        registers[ebpf::FRAME_PTR_REG] = self.env.stack_pointer;
-        registers[11] = self.executable.get_entrypoint_instruction_offset() as u64;
-        let config = self.executable.get_config();
+        registers[ebpf::FRAME_PTR_REG] = self.stack_pointer;
+        registers[11] = executable.get_entrypoint_instruction_offset() as u64;
+        let config = executable.get_config();
         let initial_insn_count = if config.enable_instruction_meter {
-            self.env.context_object_pointer.get_remaining()
+            self.context_object_pointer.get_remaining()
         } else {
             0
         };
-        self.env.previous_instruction_meter = initial_insn_count;
-        self.env.program_result = ProgramResult::Ok(0);
+        self.previous_instruction_meter = initial_insn_count;
+        self.program_result = ProgramResult::Ok(0);
         let due_insn_count = if interpreted {
             #[cfg(feature = "debugger")]
             let debug_port = self.debug_port.clone();
-            let mut interpreter = Interpreter::new(self, registers);
+            let mut interpreter = Interpreter::new(self, executable, registers);
             #[cfg(feature = "debugger")]
             if let Some(debug_port) = debug_port {
                 crate::debugger::execute(&mut interpreter, debug_port);
@@ -560,19 +552,16 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
         } else {
             #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
             {
-                let compiled_program = match self
-                    .executable
+                let compiled_program = match executable
                     .get_compiled_program()
                     .ok_or_else(|| Box::new(EbpfError::JitNotCompiled))
                 {
                     Ok(compiled_program) => compiled_program,
                     Err(error) => return (0, ProgramResult::Err(error)),
                 };
-                let instruction_meter_final = compiled_program
-                    .invoke(config, &mut self.env, registers)
-                    .max(0) as u64;
-                self.env
-                    .context_object_pointer
+                let instruction_meter_final =
+                    compiled_program.invoke(config, self, registers).max(0) as u64;
+                self.context_object_pointer
                     .get_remaining()
                     .saturating_sub(instruction_meter_final)
             }
@@ -582,13 +571,13 @@ impl<'a, V: Verifier, C: ContextObject> EbpfVm<'a, V, C> {
             }
         };
         let instruction_count = if config.enable_instruction_meter {
-            self.env.context_object_pointer.consume(due_insn_count);
-            initial_insn_count.saturating_sub(self.env.context_object_pointer.get_remaining())
+            self.context_object_pointer.consume(due_insn_count);
+            initial_insn_count.saturating_sub(self.context_object_pointer.get_remaining())
         } else {
             0
         };
         let mut result = ProgramResult::Ok(0);
-        std::mem::swap(&mut result, &mut self.env.program_result);
+        std::mem::swap(&mut result, &mut self.program_result);
         (instruction_count, result)
     }
 }

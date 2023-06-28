@@ -167,7 +167,8 @@ fn main() {
     let memory_mapping = MemoryMapping::new(regions, config, sbpf_version).unwrap();
 
     let mut vm = EbpfVm::new(
-        &verified_executable,
+        verified_executable.get_config(),
+        verified_executable.get_sbpf_version(),
         &mut context_object,
         memory_mapping,
         stack_len,
@@ -207,7 +208,10 @@ fn main() {
     if matches.value_of("use").unwrap() == "debugger" {
         vm.debug_port = Some(matches.value_of("port").unwrap().parse::<u16>().unwrap());
     }
-    let (instruction_count, result) = vm.execute_program(matches.value_of("use").unwrap() != "jit");
+    let (instruction_count, result) = vm.execute_program(
+        &verified_executable,
+        matches.value_of("use").unwrap() != "jit",
+    );
     println!("Result: {result:?}");
     println!("Instruction Count: {instruction_count}");
     if matches.is_present("trace") {
@@ -216,12 +220,12 @@ fn main() {
         analysis
             .as_ref()
             .unwrap()
-            .disassemble_trace_log(&mut stdout.lock(), &vm.env.context_object_pointer.trace_log)
+            .disassemble_trace_log(&mut stdout.lock(), &vm.context_object_pointer.trace_log)
             .unwrap();
     }
     if matches.is_present("profile") {
         let dynamic_analysis = DynamicAnalysis::new(
-            &vm.env.context_object_pointer.trace_log,
+            &vm.context_object_pointer.trace_log,
             analysis.as_ref().unwrap(),
         );
         let mut file = File::create("profile.dot").unwrap();
