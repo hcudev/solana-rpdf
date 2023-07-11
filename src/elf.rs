@@ -632,56 +632,6 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
 
     // Functions exposed for tests
 
-    /// Fix-ups relative calls
-    pub fn fixup_relative_calls(
-        function_registry: &mut FunctionRegistry,
-        loader: &BuiltinProgram<C>,
-        sbpf_version: &SBPFVersion,
-        elf_bytes: &mut [u8],
-    ) -> Result<(), ElfError> {
-        let config = loader.get_config();
-        let instruction_count = elf_bytes
-            .len()
-            .checked_div(ebpf::INSN_SIZE)
-            .ok_or(ElfError::ValueOutOfBounds)?;
-        for i in 0..instruction_count {
-            let mut insn = ebpf::get_insn(elf_bytes, i);
-            if insn.opc == ebpf::CALL_IMM
-                && insn.imm != -1
-                && !(sbpf_version.static_syscalls() && insn.src == 0)
-            {
-                let target_pc = (i as isize)
-                    .saturating_add(1)
-                    .saturating_add(insn.imm as isize);
-                if target_pc < 0 || target_pc >= instruction_count as isize {
-                    return Err(ElfError::RelativeJumpOutOfBounds(
-                        i.saturating_add(ebpf::ELF_INSN_DUMP_OFFSET),
-                    ));
-                }
-                let name = if config.enable_symbol_and_section_labels {
-                    format!("function_{target_pc}")
-                } else {
-                    String::default()
-                };
-
-                let key = register_internal_function(
-                    function_registry,
-                    loader,
-                    sbpf_version,
-                    target_pc as usize,
-                    name.as_bytes(),
-                )?;
-                insn.imm = key as i64;
-                let offset = i.saturating_mul(ebpf::INSN_SIZE);
-                let checked_slice = elf_bytes
-                    .get_mut(offset..offset.saturating_add(ebpf::INSN_SIZE))
-                    .ok_or(ElfError::ValueOutOfBounds)?;
-                checked_slice.copy_from_slice(&insn.to_array());
-            }
-        }
-        Ok(())
-    }
-
     /// Validates the ELF
     pub fn validate<'a, P: ElfParser<'a>>(
         config: &Config,
@@ -990,16 +940,48 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
         };
 
         // Fixup all program counter relative call instructions
-        Self::fixup_relative_calls(
-            function_registry,
-            loader,
-            &sbpf_version,
-            elf_bytes
-                .get_mut(text_section.file_range().unwrap_or_default())
-                .ok_or(ElfError::ValueOutOfBounds)?,
-        )?;
-
         let config = loader.get_config();
+        let text_bytes = elf_bytes
+            .get_mut(text_section.file_range().unwrap_or_default())
+            .ok_or(ElfError::ValueOutOfBounds)?;
+        let instruction_count = text_bytes
+            .len()
+            .checked_div(ebpf::INSN_SIZE)
+            .ok_or(ElfError::ValueOutOfBounds)?;
+        for i in 0..instruction_count {
+            let insn = ebpf::get_insn(text_bytes, i);
+            if insn.opc == ebpf::CALL_IMM
+                && insn.imm != -1
+                && !(sbpf_version.static_syscalls() && insn.src == 0)
+            {
+                let target_pc = (i as isize)
+                    .saturating_add(1)
+                    .saturating_add(insn.imm as isize);
+                if target_pc < 0 || target_pc >= instruction_count as isize {
+                    return Err(ElfError::RelativeJumpOutOfBounds(
+                        i.saturating_add(ebpf::ELF_INSN_DUMP_OFFSET),
+                    ));
+                }
+                let name = if config.enable_symbol_and_section_labels {
+                    format!("function_{target_pc}")
+                } else {
+                    String::default()
+                };
+                let key = register_internal_function(
+                    function_registry,
+                    loader,
+                    &sbpf_version,
+                    target_pc as usize,
+                    name.as_bytes(),
+                )?;
+                let offset = i.saturating_mul(ebpf::INSN_SIZE).saturating_add(4);
+                let checked_slice = text_bytes
+                    .get_mut(offset..offset.saturating_add(4))
+                    .ok_or(ElfError::ValueOutOfBounds)?;
+                LittleEndian::write_u32(checked_slice, key);
+            }
+        }
+
         let mut program_header: Option<&<P as ElfParser<'a>>::ProgramHeader> = None;
 
         // Fixup all the relocations in the relocation section if exists
@@ -1503,202 +1485,6 @@ mod test {
         let elf = ElfExecutable::load(&elf_bytes, loader).expect("validation failed");
         let executable: &Executable<TautologyVerifier, TestContextObject> = &elf;
         assert_eq!(0, executable.get_entrypoint_instruction_offset());
-    }
-
-    #[test]
-    fn test_fixup_relative_calls_back() {
-        let mut function_registry = FunctionRegistry::default();
-        let loader = BuiltinProgram::new_loader(Config {
-            enable_symbol_and_section_labels: true,
-            ..Config::default()
-        });
-
-        // call -2
-        #[rustfmt::skip]
-        let mut prog = vec![
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x85, 0x10, 0x00, 0x00, 0xfe, 0xff, 0xff, 0xff];
-
-        ElfExecutable::fixup_relative_calls(
-            &mut function_registry,
-            &loader,
-            &SBPFVersion::V1,
-            &mut prog,
-        )
-        .unwrap();
-        let name = "function_4".to_string();
-        let hash = hash_internal_function(4, name.as_bytes());
-        let insn = ebpf::Insn {
-            opc: 0x85,
-            dst: 0,
-            src: 1,
-            imm: hash as i64,
-            ..ebpf::Insn::default()
-        };
-        assert_eq!(insn.to_array(), prog[40..]);
-        assert_eq!(*function_registry.get(&hash).unwrap(), (4, name));
-
-        // call +6
-        let mut function_registry = FunctionRegistry::default();
-        prog.splice(44.., vec![0xfa, 0xff, 0xff, 0xff]);
-        ElfExecutable::fixup_relative_calls(
-            &mut function_registry,
-            &loader,
-            &SBPFVersion::V1,
-            &mut prog,
-        )
-        .unwrap();
-        let name = "function_0".to_string();
-        let hash = hash_internal_function(0, name.as_bytes());
-        let insn = ebpf::Insn {
-            opc: 0x85,
-            dst: 0,
-            src: 1,
-            imm: hash as i64,
-            ..ebpf::Insn::default()
-        };
-        assert_eq!(insn.to_array(), prog[40..]);
-        assert_eq!(*function_registry.get(&hash).unwrap(), (0, name));
-    }
-
-    #[test]
-    fn test_fixup_relative_calls_forward() {
-        let mut function_registry = FunctionRegistry::default();
-        let loader = BuiltinProgram::new_loader(Config {
-            enable_symbol_and_section_labels: true,
-            ..Config::default()
-        });
-
-        // call +0
-        #[rustfmt::skip]
-        let mut prog = vec![
-            0x85, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-
-        ElfExecutable::fixup_relative_calls(
-            &mut function_registry,
-            &loader,
-            &SBPFVersion::V1,
-            &mut prog,
-        )
-        .unwrap();
-        let name = "function_1".to_string();
-        let hash = hash_internal_function(1, name.as_bytes());
-        let insn = ebpf::Insn {
-            opc: 0x85,
-            dst: 0,
-            src: 1,
-            imm: hash as i64,
-            ..ebpf::Insn::default()
-        };
-        assert_eq!(insn.to_array(), prog[..8]);
-        assert_eq!(*function_registry.get(&hash).unwrap(), (1, name));
-
-        // call +4
-        let mut function_registry = FunctionRegistry::default();
-        prog.splice(4..8, vec![0x04, 0x00, 0x00, 0x00]);
-        ElfExecutable::fixup_relative_calls(
-            &mut function_registry,
-            &loader,
-            &SBPFVersion::V1,
-            &mut prog,
-        )
-        .unwrap();
-        let name = "function_5".to_string();
-        let hash = hash_internal_function(5, name.as_bytes());
-        let insn = ebpf::Insn {
-            opc: 0x85,
-            dst: 0,
-            src: 1,
-            imm: hash as i64,
-            ..ebpf::Insn::default()
-        };
-        assert_eq!(insn.to_array(), prog[..8]);
-        assert_eq!(*function_registry.get(&hash).unwrap(), (5, name));
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "called `Result::unwrap()` on an `Err` value: RelativeJumpOutOfBounds(29)"
-    )]
-    fn test_fixup_relative_calls_out_of_bounds_forward() {
-        let mut function_registry = FunctionRegistry::default();
-        let loader = loader();
-
-        // call +5
-        #[rustfmt::skip]
-        let mut prog = vec![
-            0x85, 0x10, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-
-        ElfExecutable::fixup_relative_calls(
-            &mut function_registry,
-            &loader,
-            &SBPFVersion::V2,
-            &mut prog,
-        )
-        .unwrap();
-        let name = "function_1".to_string();
-        let hash = hash_internal_function(1, name.as_bytes());
-        let insn = ebpf::Insn {
-            opc: 0x85,
-            dst: 0,
-            src: 1,
-            imm: hash as i64,
-            ..ebpf::Insn::default()
-        };
-        assert_eq!(insn.to_array(), prog[..8]);
-        assert_eq!(*function_registry.get(&hash).unwrap(), (1, name));
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "called `Result::unwrap()` on an `Err` value: RelativeJumpOutOfBounds(34)"
-    )]
-    fn test_fixup_relative_calls_out_of_bounds_back() {
-        let mut function_registry = FunctionRegistry::default();
-        let loader = loader();
-
-        // call -7
-        #[rustfmt::skip]
-        let mut prog = vec![
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0xb7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x85, 0x10, 0x00, 0x00, 0xf9, 0xff, 0xff, 0xff];
-
-        ElfExecutable::fixup_relative_calls(
-            &mut function_registry,
-            &loader,
-            &SBPFVersion::V2,
-            &mut prog,
-        )
-        .unwrap();
-        let name = "function_4".to_string();
-        let hash = hash_internal_function(4, name.as_bytes());
-        let insn = ebpf::Insn {
-            opc: 0x85,
-            dst: 0,
-            src: 1,
-            imm: hash as i64,
-            ..ebpf::Insn::default()
-        };
-        assert_eq!(insn.to_array(), prog[40..]);
-        assert_eq!(*function_registry.get(&hash).unwrap(), (4, name));
     }
 
     #[test]
@@ -2278,6 +2064,24 @@ mod test {
     fn test_program_headers_overflow() {
         let elf_bytes = std::fs::read("tests/elfs/program_headers_overflow.so")
             .expect("failed to read elf file");
+        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
+    }
+
+    #[test]
+    #[should_panic(expected = "validation failed: RelativeJumpOutOfBounds(43)")]
+    fn test_relative_call_oob_forward() {
+        let mut elf_bytes =
+            std::fs::read("tests/elfs/relative_call_sbpfv1.so").expect("failed to read elf file");
+        LittleEndian::write_i32(&mut elf_bytes[0x1074..0x1078], 11);
+        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
+    }
+
+    #[test]
+    #[should_panic(expected = "validation failed: RelativeJumpOutOfBounds(43)")]
+    fn test_relative_call_oob_backward() {
+        let mut elf_bytes =
+            std::fs::read("tests/elfs/relative_call_sbpfv1.so").expect("failed to read elf file");
+        LittleEndian::write_i32(&mut elf_bytes[0x1074..0x1078], -16i32);
         ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
     }
 }
