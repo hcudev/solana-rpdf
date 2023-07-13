@@ -5,11 +5,11 @@ use libfuzzer_sys::fuzz_target;
 use grammar_aware::*;
 use solana_rbpf::{
     ebpf,
-    elf::{Executable, SBPFVersion},
+    elf::{Executable, FunctionRegistry, SBPFVersion},
     insn_builder::{Arch, Instruction, IntoBytes},
     memory_region::MemoryRegion,
     verifier::{RequisiteVerifier, TautologyVerifier, Verifier},
-    vm::{BuiltinProgram, FunctionRegistry, TestContextObject},
+    vm::{BuiltinProgram, TestContextObject},
 };
 use test_utils::create_vm;
 
@@ -47,7 +47,7 @@ fuzz_target!(|data: FuzzData| {
     let mut jit_mem = data.mem;
     let mut executable = Executable::<TautologyVerifier, TestContextObject>::from_text_bytes(
         prog.into_bytes(),
-        std::sync::Arc::new(BuiltinProgram::new_loader(config)),
+        std::sync::Arc::new(BuiltinProgram::new_loader(config, FunctionRegistry::default())),
         SBPFVersion::V2,
         function_registry,
     )

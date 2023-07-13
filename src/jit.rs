@@ -599,7 +599,7 @@ impl<'a, V: Verifier, C: ContextObject> JitCompiler<'a, V, C> {
                     };
 
                     if external {
-                        if let Some((_function_name, function)) = self.executable.get_loader().lookup_function(insn.imm as u32) {
+                        if let Some((_function_name, function)) = self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
                             self.emit_validate_and_profile_instruction_count(true, Some(0));
                             self.emit_ins(X86Instruction::load_immediate(OperandSize::S64, R11, function as usize as i64));
                             self.emit_ins(X86Instruction::call_immediate(self.relative_to_anchor(ANCHOR_EXTERNAL_FUNCTION_CALL, 5)));
@@ -609,7 +609,7 @@ impl<'a, V: Verifier, C: ContextObject> JitCompiler<'a, V, C> {
                     }
 
                     if internal {
-                        if let Some(target_pc) = self.executable.lookup_internal_function(insn.imm as u32) {
+                        if let Some((_function_name, target_pc)) = self.executable.get_function_registry().lookup_by_key(insn.imm as u32) {
                             self.emit_internal_call(Value::Constant64(target_pc as i64, false));
                             resolved = true;
                         }
@@ -1533,13 +1533,13 @@ impl<'a, V: Verifier, C: ContextObject> JitCompiler<'a, V, C> {
         if self.executable.get_sbpf_version().static_syscalls() {
             let mut prev_pc = 0;
             for current_pc in self.executable.get_function_registry().keys() {
-                if *current_pc as usize >= self.result.pc_section.len() {
+                if current_pc as usize >= self.result.pc_section.len() {
                     break;
                 }
-                for pc in prev_pc..*current_pc as usize {
+                for pc in prev_pc..current_pc as usize {
                     self.result.pc_section[pc] = call_unsupported_instruction;
                 }
-                prev_pc = *current_pc as usize + 1;
+                prev_pc = current_pc as usize + 1;
             }
             for pc in prev_pc..self.result.pc_section.len() {
                 self.result.pc_section[pc] = call_unsupported_instruction;
@@ -1552,10 +1552,10 @@ impl<'a, V: Verifier, C: ContextObject> JitCompiler<'a, V, C> {
 mod tests {
     use super::*;
     use crate::{
-        elf::SBPFVersion,
+        elf::{FunctionRegistry, SBPFVersion},
         syscalls,
         verifier::TautologyVerifier,
-        vm::{BuiltinProgram, FunctionRegistry, TestContextObject},
+        vm::{BuiltinFunction, BuiltinProgram, TestContextObject},
     };
     use byteorder::{ByteOrder, LittleEndian};
     use std::sync::Arc;
@@ -1598,15 +1598,22 @@ mod tests {
     fn create_mockup_executable(
         program: &[u8],
     ) -> Executable<TautologyVerifier, TestContextObject> {
-        let mut loader = BuiltinProgram::new_loader(Config {
-            noop_instruction_rate: 0,
-            ..Config::default()
-        });
-        loader
-            .register_function(b"gather_bytes", syscalls::bpf_gather_bytes)
+        let mut function_registry =
+            FunctionRegistry::<BuiltinFunction<TestContextObject>>::default();
+        function_registry
+            .register_function_hashed(*b"gather_bytes", syscalls::bpf_gather_bytes)
             .unwrap();
+        let loader = BuiltinProgram::new_loader(
+            Config {
+                noop_instruction_rate: 0,
+                ..Config::default()
+            },
+            function_registry,
+        );
         let mut function_registry = FunctionRegistry::default();
-        function_registry.insert(8, (8, "function_foo".to_string()));
+        function_registry
+            .register_function(8, *b"function_foo", 8)
+            .unwrap();
         Executable::<TautologyVerifier, TestContextObject>::from_text_bytes(
             program,
             Arc::new(loader),
