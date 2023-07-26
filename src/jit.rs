@@ -329,12 +329,16 @@ impl<'a, V: Verifier, C: ContextObject> JitCompiler<'a, V, C> {
 
         // Scan through program to find actual number of instructions
         let mut pc = 0;
-        while (pc + 1) * ebpf::INSN_SIZE <= program.len() {
-            let insn = ebpf::get_insn_unchecked(program, pc);
-            pc += match insn.opc {
-                ebpf::LD_DW_IMM => 2,
-                _ => 1,
-            };
+        if executable.get_sbpf_version().disable_lddw() {
+            pc = program.len() / ebpf::INSN_SIZE;
+        } else {
+            while (pc + 1) * ebpf::INSN_SIZE <= program.len() {
+                let insn = ebpf::get_insn_unchecked(program, pc);
+                pc += match insn.opc {
+                    ebpf::LD_DW_IMM => 2,
+                    _ => 1,
+                };
+            }
         }
 
         let mut code_length_estimate = MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH + MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION * pc;
@@ -397,6 +401,9 @@ impl<'a, V: Verifier, C: ContextObject> JitCompiler<'a, V, C> {
                     self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, RBP, insn.imm, Some(stack_ptr_access)));
                 }
 
+                ebpf::LD_UW_IMM => {
+                    self.emit_sanitized_alu(OperandSize::S64, 0x09, 1, dst, (insn.imm as u64).wrapping_shl(32) as i64);
+                }
                 ebpf::LD_DW_IMM  => {
                     self.emit_validate_and_profile_instruction_count(true, Some(self.pc + 2));
                     self.pc += 1;
