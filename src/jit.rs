@@ -770,29 +770,35 @@ impl<'a, V: Verifier, C: ContextObject> JitCompiler<'a, V, C> {
     fn emit_sanitized_load_immediate(&mut self, size: OperandSize, destination: u8, value: i64) {
         match size {
             OperandSize::S32 => {
-                let key: i32 = self.diversification_rng.gen();
-                self.emit_ins(X86Instruction::load_immediate(size, destination, (value as i32).wrapping_sub(key) as i64));
-                self.emit_ins(X86Instruction::alu(size, 0x81, 0, destination, key as i64, None));
-            },
-            OperandSize::S64 if destination == R11 => {
-                let key: i64 = self.diversification_rng.gen();
-                let lower_key = key as i32 as i64;
-                let upper_key = (key >> 32) as i32 as i64;
-                self.emit_ins(X86Instruction::load_immediate(size, destination, value.wrapping_sub(lower_key).rotate_right(32).wrapping_sub(upper_key)));
-                self.emit_ins(X86Instruction::alu(size, 0x81, 0, destination, upper_key, None)); // wrapping_add(upper_key)
-                self.emit_ins(X86Instruction::alu(size, 0xc1, 1, destination, 32, None)); // rotate_right(32)
-                self.emit_ins(X86Instruction::alu(size, 0x81, 0, destination, lower_key, None)); // wrapping_add(lower_key)
+                let key = self.diversification_rng.gen::<i32>() as i64;
+                self.emit_ins(X86Instruction::load_immediate(size, destination, (value as i32).wrapping_sub(key as i32) as i64));
+                self.emit_ins(X86Instruction::alu(size, 0x81, 0, destination, key, None));
             },
             OperandSize::S64 if value >= i32::MIN as i64 && value <= i32::MAX as i64 => {
                 let key = self.diversification_rng.gen::<i32>() as i64;
                 self.emit_ins(X86Instruction::load_immediate(size, destination, value.wrapping_sub(key)));
                 self.emit_ins(X86Instruction::alu(size, 0x81, 0, destination, key, None));
             },
+            OperandSize::S64 if value as u64 & u32::MAX as u64 == 0 => {
+                let key = self.diversification_rng.gen::<i32>() as i64;
+                self.emit_ins(X86Instruction::load_immediate(size, destination, value.rotate_right(32).wrapping_sub(key)));
+                self.emit_ins(X86Instruction::alu(size, 0x81, 0, destination, key, None)); // wrapping_add(key)
+                self.emit_ins(X86Instruction::alu(size, 0xc1, 4, destination, 32, None)); // shift_left(32)
+            },
             OperandSize::S64 => {
-                let key: i64 = self.diversification_rng.gen();
-                self.emit_ins(X86Instruction::load_immediate(size, destination, value.wrapping_sub(key)));
-                self.emit_ins(X86Instruction::load_immediate(size, R11, key));
-                self.emit_ins(X86Instruction::alu(size, 0x01, R11, destination, 0, None));
+                let key = self.diversification_rng.gen::<i64>();
+                if destination != R11 {
+                    self.emit_ins(X86Instruction::load_immediate(size, destination, value.wrapping_sub(key)));
+                    self.emit_ins(X86Instruction::load_immediate(size, R11, key));
+                    self.emit_ins(X86Instruction::alu(size, 0x01, R11, destination, 0, None));
+                } else {
+                    let lower_key = key as i32 as i64;
+                    let upper_key = (key >> 32) as i32 as i64;
+                    self.emit_ins(X86Instruction::load_immediate(size, destination, value.wrapping_sub(lower_key).rotate_right(32).wrapping_sub(upper_key)));
+                    self.emit_ins(X86Instruction::alu(size, 0x81, 0, destination, upper_key, None)); // wrapping_add(upper_key)
+                    self.emit_ins(X86Instruction::alu(size, 0xc1, 1, destination, 32, None)); // rotate_right(32)
+                    self.emit_ins(X86Instruction::alu(size, 0x81, 0, destination, lower_key, None)); // wrapping_add(lower_key)
+                }
             },
             _ => {
                 #[cfg(debug_assertions)]
@@ -805,9 +811,12 @@ impl<'a, V: Verifier, C: ContextObject> JitCompiler<'a, V, C> {
     fn emit_sanitized_alu(&mut self, size: OperandSize, opcode: u8, opcode_extension: u8, destination: u8, immediate: i64) {
         if self.should_sanitize_constant(immediate) {
             self.emit_sanitized_load_immediate(size, R11, immediate);
-            self.emit_ins(X86Instruction::alu(size, opcode, R11, destination, immediate, None));
-        } else {
+            self.emit_ins(X86Instruction::alu(size, opcode, R11, destination, 0, None));
+        } else if immediate >= i32::MIN as i64 && immediate <= i32::MAX as i64 {
             self.emit_ins(X86Instruction::alu(size, 0x81, opcode_extension, destination, immediate, None));
+        } else {
+            self.emit_ins(X86Instruction::load_immediate(size, R11, immediate));
+            self.emit_ins(X86Instruction::alu(size, opcode, R11, destination, 0, None));
         }
     }
 
