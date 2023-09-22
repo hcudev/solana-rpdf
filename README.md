@@ -78,6 +78,15 @@ Here are the steps to follow to run an eBPF program with rbpf:
 7. Execute your program: Either run the interpreter or call the JIT-compiled
    function.
 
+## Developer
+
+### Dependencies
+- rustc version 1.72 or higher
+
+### Build and test instructions
+- To build run `cargo build`
+- To test run `cargo test`
+
 ## License
 
 Following the effort of the Rust language project itself in order to ease
