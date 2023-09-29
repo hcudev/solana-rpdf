@@ -22,11 +22,10 @@ use std::convert::TryInto;
 
 /// Virtual memory operation helper.
 macro_rules! translate_memory_access {
-    (_impl, $self:ident, $op:ident, $vm_addr:ident, $pc:ident, $T:ty, $($rest:expr),*) => {
+    (_impl, $self:ident, $op:ident, $vm_addr:ident, $T:ty, $($rest:expr),*) => {
         match $self.vm.memory_mapping.$op::<$T>(
             $($rest,)*
             $vm_addr,
-            $pc + ebpf::ELF_INSN_DUMP_OFFSET,
         ) {
             ProgramResult::Ok(v) => v,
             ProgramResult::Err(err) => {
@@ -37,35 +36,29 @@ macro_rules! translate_memory_access {
     };
 
     // MemoryMapping::load()
-    ($self:ident, load, $vm_addr:ident, $pc:ident, $T:ty) => {
-        translate_memory_access!(_impl, $self, load, $vm_addr, $pc, $T,)
+    ($self:ident, load, $vm_addr:ident, $T:ty) => {
+        translate_memory_access!(_impl, $self, load, $vm_addr, $T,)
     };
 
     // MemoryMapping::store()
-    ($self:ident, store, $value:expr, $vm_addr:ident, $pc:ident, $T:ty) => {
-        translate_memory_access!(_impl, $self, store, $vm_addr, $pc, $T, ($value) as $T);
+    ($self:ident, store, $value:expr, $vm_addr:ident, $T:ty) => {
+        translate_memory_access!(_impl, $self, store, $vm_addr, $T, ($value) as $T);
     };
 }
 
 macro_rules! throw_error {
     ($self:expr, $err:expr) => {{
-        $self.vm.program_result = ProgramResult::Err(Box::new($err));
+        $self.vm.program_result = ProgramResult::Err($err);
         return false;
     }};
-    (DivideByZero; $self:expr, $pc:expr, $src:expr, $ty:ty) => {
+    (DivideByZero; $self:expr, $src:expr, $ty:ty) => {
         if $src as $ty == 0 {
-            throw_error!(
-                $self,
-                EbpfError::DivideByZero($pc + ebpf::ELF_INSN_DUMP_OFFSET)
-            );
+            throw_error!($self, EbpfError::DivideByZero);
         }
     };
-    (DivideOverflow; $self:expr, $pc:expr, $src:expr, $dst:expr, $ty:ty) => {
+    (DivideOverflow; $self:expr, $src:expr, $dst:expr, $ty:ty) => {
         if $dst as $ty == <$ty>::MIN && $src as $ty == -1 {
-            throw_error!(
-                $self,
-                EbpfError::DivideOverflow($pc + ebpf::ELF_INSN_DUMP_OFFSET)
-            );
+            throw_error!($self, EbpfError::DivideOverflow);
         }
     };
 }
@@ -121,7 +114,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
         }
     }
 
-    fn check_pc(&mut self, current_pc: usize) -> bool {
+    fn check_pc(&mut self) -> bool {
         if self
             .pc
             .checked_mul(ebpf::INSN_SIZE)
@@ -130,13 +123,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
         {
             true
         } else {
-            throw_error!(
-                self,
-                EbpfError::CallOutsideTextSegment(
-                    current_pc + ebpf::ELF_INSN_DUMP_OFFSET,
-                    self.program_vm_addr + (self.pc * ebpf::INSN_SIZE) as u64,
-                )
-            );
+            throw_error!(self, EbpfError::CallOutsideTextSegment);
         }
     }
 
@@ -156,13 +143,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
 
         self.vm.call_depth += 1;
         if self.vm.call_depth as usize == config.max_call_depth {
-            throw_error!(
-                self,
-                EbpfError::CallDepthExceeded(
-                    self.pc + ebpf::ELF_INSN_DUMP_OFFSET - 1,
-                    config.max_call_depth,
-                )
-            );
+            throw_error!(self, EbpfError::CallDepthExceeded);
         }
 
         if !self.executable.get_sbpf_version().dynamic_stack_frames() {
@@ -183,12 +164,11 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
     pub fn step(&mut self) -> bool {
         let config = &self.executable.get_config();
 
-        let mut instruction_width = 1;
         self.due_insn_count += 1;
         let pc = self.pc;
-        self.pc += instruction_width;
+        self.pc += 1;
         if self.pc * ebpf::INSN_SIZE > self.program.len() {
-            throw_error!(self, EbpfError::ExecutionOverrun(pc + ebpf::ELF_INSN_DUMP_OFFSET));
+            throw_error!(self, EbpfError::ExecutionOverrun);
         }
         let mut insn = ebpf::get_insn_unchecked(self.program, pc);
         let dst = insn.dst as usize;
@@ -214,7 +194,6 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
 
             ebpf::LD_DW_IMM  => {
                 ebpf::augment_lddw_unchecked(self.program, &mut insn);
-                instruction_width = 2;
                 self.pc += 1;
                 self.reg[dst] = insn.imm as u64;
             },
@@ -222,55 +201,55 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             // BPF_LDX class
             ebpf::LD_B_REG   => {
                 let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, pc, u8);
+                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u8);
             },
             ebpf::LD_H_REG   => {
                 let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, pc, u16);
+                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u16);
             },
             ebpf::LD_W_REG   => {
                 let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, pc, u32);
+                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u32);
             },
             ebpf::LD_DW_REG  => {
                 let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, pc, u64);
+                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u64);
             },
 
             // BPF_ST class
             ebpf::ST_B_IMM   => {
                 let vm_addr = (self.reg[dst] as i64).wrapping_add( insn.off as i64) as u64;
-                translate_memory_access!(self, store, insn.imm, vm_addr, pc, u8);
+                translate_memory_access!(self, store, insn.imm, vm_addr, u8);
             },
             ebpf::ST_H_IMM   => {
                 let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, insn.imm, vm_addr, pc, u16);
+                translate_memory_access!(self, store, insn.imm, vm_addr, u16);
             },
             ebpf::ST_W_IMM   => {
                 let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, insn.imm, vm_addr, pc, u32);
+                translate_memory_access!(self, store, insn.imm, vm_addr, u32);
             },
             ebpf::ST_DW_IMM  => {
                 let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, insn.imm, vm_addr, pc, u64);
+                translate_memory_access!(self, store, insn.imm, vm_addr, u64);
             },
 
             // BPF_STX class
             ebpf::ST_B_REG   => {
                 let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, pc, u8);
+                translate_memory_access!(self, store, self.reg[src], vm_addr, u8);
             },
             ebpf::ST_H_REG   => {
                 let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, pc, u16);
+                translate_memory_access!(self, store, self.reg[src], vm_addr, u16);
             },
             ebpf::ST_W_REG   => {
                 let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, pc, u32);
+                translate_memory_access!(self, store, self.reg[src], vm_addr, u32);
             },
             ebpf::ST_DW_REG  => {
                 let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, pc, u64);
+                translate_memory_access!(self, store, self.reg[src], vm_addr, u64);
             },
 
             // BPF_ALU class
@@ -286,7 +265,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             ebpf::MUL32_REG  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as i32).wrapping_mul(self.reg[src] as i32) as u64,
             ebpf::DIV32_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as u32             / insn.imm as u32)      as u64,
             ebpf::DIV32_REG  if !self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], u32);
+                throw_error!(DivideByZero; self, self.reg[src], u32);
                                 self.reg[dst] = (self.reg[dst] as u32             / self.reg[src] as u32) as u64;
             },
             ebpf::OR32_IMM   => self.reg[dst] = (self.reg[dst] as u32             | insn.imm as u32)      as u64,
@@ -300,7 +279,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             ebpf::NEG32      if self.executable.get_sbpf_version().enable_neg() => self.reg[dst] = (self.reg[dst] as i32).wrapping_neg()                     as u64 & (u32::MAX as u64),
             ebpf::MOD32_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as u32             % insn.imm as u32)      as u64,
             ebpf::MOD32_REG  if !self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], u32);
+                throw_error!(DivideByZero; self, self.reg[src], u32);
                                 self.reg[dst] = (self.reg[dst] as u32             % self.reg[src] as u32) as u64;
             },
             ebpf::XOR32_IMM  => self.reg[dst] = (self.reg[dst] as u32             ^ insn.imm as u32)      as u64,
@@ -315,7 +294,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                     32 => (self.reg[dst] as u32).to_le() as u64,
                     64 =>  self.reg[dst].to_le(),
                     _  => {
-                        throw_error!(self, EbpfError::InvalidInstruction(pc + ebpf::ELF_INSN_DUMP_OFFSET));
+                        throw_error!(self, EbpfError::InvalidInstruction);
                     }
                 };
             },
@@ -325,7 +304,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                     32 => (self.reg[dst] as u32).to_be() as u64,
                     64 =>  self.reg[dst].to_be(),
                     _  => {
-                        throw_error!(self, EbpfError::InvalidInstruction(pc + ebpf::ELF_INSN_DUMP_OFFSET));
+                        throw_error!(self, EbpfError::InvalidInstruction);
                     }
                 };
             },
@@ -343,7 +322,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             ebpf::MUL64_REG  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] =  self.reg[dst].wrapping_mul(self.reg[src]),
             ebpf::DIV64_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] /= insn.imm as u64,
             ebpf::DIV64_REG  if !self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], u64);
+                throw_error!(DivideByZero; self, self.reg[src], u64);
                                 self.reg[dst] /= self.reg[src];
             },
             ebpf::OR64_IMM   => self.reg[dst] |= insn.imm as u64,
@@ -357,7 +336,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             ebpf::NEG64      if self.executable.get_sbpf_version().enable_neg() => self.reg[dst] = (self.reg[dst] as i64).wrapping_neg() as u64,
             ebpf::MOD64_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] %= insn.imm as u64,
             ebpf::MOD64_REG  if !self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], u64);
+                throw_error!(DivideByZero; self, self.reg[src], u64);
                                 self.reg[dst] %= self.reg[src];
             },
             ebpf::XOR64_IMM  => self.reg[dst] ^= insn.imm as u64,
@@ -383,64 +362,64 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                                 self.reg[dst] = (self.reg[dst] as u32 / insn.imm as u32)      as u64;
             }
             ebpf::UDIV32_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], u32);
+                throw_error!(DivideByZero; self, self.reg[src], u32);
                                 self.reg[dst] = (self.reg[dst] as u32 / self.reg[src] as u32) as u64;
             },
             ebpf::UDIV64_IMM if self.executable.get_sbpf_version().enable_pqr() => {
                                 self.reg[dst] /= insn.imm as u64;
             }
             ebpf::UDIV64_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], u64);
+                throw_error!(DivideByZero; self, self.reg[src], u64);
                                 self.reg[dst] /= self.reg[src];
             },
             ebpf::UREM32_IMM if self.executable.get_sbpf_version().enable_pqr() => {
                                 self.reg[dst] = (self.reg[dst] as u32 % insn.imm as u32)      as u64;
             }
             ebpf::UREM32_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], u32);
+                throw_error!(DivideByZero; self, self.reg[src], u32);
                                 self.reg[dst] = (self.reg[dst] as u32 % self.reg[src] as u32) as u64;
             },
             ebpf::UREM64_IMM if self.executable.get_sbpf_version().enable_pqr() => {
                                 self.reg[dst] %= insn.imm as u64;
             }
             ebpf::UREM64_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], u64);
+                throw_error!(DivideByZero; self, self.reg[src], u64);
                                 self.reg[dst] %= self.reg[src];
             },
             ebpf::SDIV32_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideOverflow; self, pc, insn.imm, self.reg[dst], i32);
+                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst], i32);
                                 self.reg[dst] = (self.reg[dst] as i32 / insn.imm as i32)      as u64;
             }
             ebpf::SDIV32_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], i32);
-                throw_error!(DivideOverflow; self, pc, self.reg[src], self.reg[dst], i32);
+                throw_error!(DivideByZero; self, self.reg[src], i32);
+                throw_error!(DivideOverflow; self, self.reg[src], self.reg[dst], i32);
                                 self.reg[dst] = (self.reg[dst] as i32 / self.reg[src] as i32) as u64;
             },
             ebpf::SDIV64_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideOverflow; self, pc, insn.imm, self.reg[dst], i64);
+                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst], i64);
                                 self.reg[dst] = (self.reg[dst] as i64 / insn.imm)             as u64;
             }
             ebpf::SDIV64_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], i64);
-                throw_error!(DivideOverflow; self, pc, self.reg[src], self.reg[dst], i64);
+                throw_error!(DivideByZero; self, self.reg[src], i64);
+                throw_error!(DivideOverflow; self, self.reg[src], self.reg[dst], i64);
                                 self.reg[dst] = (self.reg[dst] as i64 / self.reg[src] as i64) as u64;
             },
             ebpf::SREM32_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideOverflow; self, pc, insn.imm, self.reg[dst], i32);
+                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst], i32);
                                 self.reg[dst] = (self.reg[dst] as i32 % insn.imm as i32)      as u64;
             }
             ebpf::SREM32_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], i32);
-                throw_error!(DivideOverflow; self, pc, self.reg[src], self.reg[dst], i32);
+                throw_error!(DivideByZero; self, self.reg[src], i32);
+                throw_error!(DivideOverflow; self, self.reg[src], self.reg[dst], i32);
                                 self.reg[dst] = (self.reg[dst] as i32 % self.reg[src] as i32) as u64;
             },
             ebpf::SREM64_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideOverflow; self, pc, insn.imm, self.reg[dst], i64);
+                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst], i64);
                                 self.reg[dst] = (self.reg[dst] as i64 % insn.imm)             as u64;
             }
             ebpf::SREM64_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, pc, self.reg[src], i64);
-                throw_error!(DivideOverflow; self, pc, self.reg[src], self.reg[dst], i64);
+                throw_error!(DivideByZero; self, self.reg[src], i64);
+                throw_error!(DivideOverflow; self, self.reg[src], self.reg[dst], i64);
                                 self.reg[dst] = (self.reg[dst] as i64 % self.reg[src] as i64) as u64;
             },
 
@@ -479,15 +458,15 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                     return false;
                 }
                 if target_pc < self.program_vm_addr {
-                    throw_error!(self, EbpfError::CallOutsideTextSegment(pc + ebpf::ELF_INSN_DUMP_OFFSET, target_pc / ebpf::INSN_SIZE as u64 * ebpf::INSN_SIZE as u64));
+                    throw_error!(self, EbpfError::CallOutsideTextSegment);
                 }
                 self.pc = (target_pc - self.program_vm_addr) as usize / ebpf::INSN_SIZE;
-                if !self.check_pc(pc) {
+                if !self.check_pc() {
                     return false;
                 }
                 if self.executable.get_sbpf_version().static_syscalls() && self.executable.get_function_registry().lookup_by_key(self.pc as u32).is_none() {
                     self.due_insn_count += 1;
-                    throw_error!(self, EbpfError::UnsupportedInstruction(self.pc + ebpf::ELF_INSN_DUMP_OFFSET));
+                    throw_error!(self, EbpfError::UnsupportedInstruction);
                 }
             },
 
@@ -538,21 +517,21 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                             return false;
                         }
                         self.pc = target_pc;
-                        if !self.check_pc(pc) {
+                        if !self.check_pc() {
                             return false;
                         }
                     }
                 }
 
                 if !resolved {
-                    throw_error!(self, EbpfError::UnsupportedInstruction(pc + ebpf::ELF_INSN_DUMP_OFFSET));
+                    throw_error!(self, EbpfError::UnsupportedInstruction);
                 }
             }
 
             ebpf::EXIT       => {
                 if self.vm.call_depth == 0 {
                     if config.enable_instruction_meter && self.due_insn_count > self.vm.previous_instruction_meter {
-                        throw_error!(self, EbpfError::ExceededMaxInstructions(pc + ebpf::ELF_INSN_DUMP_OFFSET));
+                        throw_error!(self, EbpfError::ExceededMaxInstructions);
                     }
                     self.vm.program_result = ProgramResult::Ok(self.reg[0]);
                     return false;
@@ -570,16 +549,15 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                         config.stack_frame_size * if config.enable_stack_frame_gaps { 2 } else { 1 };
                     self.vm.stack_pointer -= stack_frame_size as u64;
                 }
-                if !self.check_pc(pc) {
+                if !self.check_pc() {
                     return false;
                 }
             }
-            _ => throw_error!(self, EbpfError::UnsupportedInstruction(pc + ebpf::ELF_INSN_DUMP_OFFSET)),
+            _ => throw_error!(self, EbpfError::UnsupportedInstruction),
         }
 
         if config.enable_instruction_meter && self.due_insn_count >= self.vm.previous_instruction_meter {
-            // Use `pc + instruction_width` instead of `self.pc` here because jumps and calls don't continue at the end of this instruction
-            throw_error!(self, EbpfError::ExceededMaxInstructions(pc + instruction_width + ebpf::ELF_INSN_DUMP_OFFSET));
+            throw_error!(self, EbpfError::ExceededMaxInstructions);
         }
 
         true

@@ -17,7 +17,10 @@
 //! <https://www.kernel.org/doc/Documentation/networking/filter.txt>, or for a shorter version of
 //! the list of the operation codes: <https://github.com/iovisor/bpf-docs/blob/master/eBPF.md>
 
-use crate::{elf::ElfError, memory_region::AccessType, verifier::VerifierError};
+use {
+    crate::{elf::ElfError, memory_region::AccessType, verifier::VerifierError},
+    std::error::Error,
+};
 
 /// Error definitions
 #[derive(Debug, thiserror::Error)]
@@ -30,28 +33,26 @@ pub enum EbpfError {
     #[error("function #{0} was already registered")]
     FunctionAlreadyRegistered(usize),
     /// Exceeded max BPF to BPF call depth
-    #[error("exceeded max BPF to BPF call depth of {1} at BPF instruction #{0}")]
-    CallDepthExceeded(usize, usize),
+    #[error("exceeded max BPF to BPF call depth")]
+    CallDepthExceeded,
     /// Attempt to exit from root call frame
     #[error("attempted to exit root call frame")]
     ExitRootCallFrame,
     /// Divide by zero"
-    #[error("divide by zero at BPF instruction {0}")]
-    DivideByZero(usize),
+    #[error("divide by zero at BPF instruction")]
+    DivideByZero,
     /// Divide overflow
-    #[error("division overflow at BPF instruction {0}")]
-    DivideOverflow(usize),
+    #[error("division overflow at BPF instruction")]
+    DivideOverflow,
     /// Exceeded max instructions allowed
-    #[error("attempted to execute past the end of the text segment at BPF instruction #{0}")]
-    ExecutionOverrun(usize),
+    #[error("attempted to execute past the end of the text segment at BPF instruction")]
+    ExecutionOverrun,
     /// Attempt to call to an address outside the text segment
-    #[error(
-        "callx at BPF instruction {0} attempted to call outside of the text segment to addr 0x{1:x}"
-    )]
-    CallOutsideTextSegment(usize, u64),
+    #[error("callx attempted to call outside of the text segment")]
+    CallOutsideTextSegment,
     /// Exceeded max instructions allowed
-    #[error("exceeded CUs meter at BPF instruction #{0}")]
-    ExceededMaxInstructions(usize),
+    #[error("exceeded CUs meter at BPF instruction")]
+    ExceededMaxInstructions,
     /// Program has not been JIT-compiled
     #[error("program has not been JIT-compiled")]
     JitNotCompiled,
@@ -62,21 +63,17 @@ pub enum EbpfError {
     #[error("Invalid memory region at index {0}")]
     InvalidMemoryRegion(usize),
     /// Access violation (general)
-    #[error(
-        "Access violation in {4} section at address {2:#x} of size {3:?} at BPF instruction #{0}"
-    )]
-    AccessViolation(usize, AccessType, u64, u64, &'static str),
+    #[error("Access violation in {3} section at address {1:#x} of size {2:?}")]
+    AccessViolation(AccessType, u64, u64, &'static str),
     /// Access violation (stack specific)
-    #[error(
-        "Access violation in stack frame {4} at address {2:#x} of size {3:?} at BPF instruction #{0}"
-    )]
-    StackAccessViolation(usize, AccessType, u64, u64, i64),
+    #[error("Access violation in stack frame {3} at address {1:#x} of size {2:?}")]
+    StackAccessViolation(AccessType, u64, u64, i64),
     /// Invalid instruction
-    #[error("invalid BPF instruction at {0}")]
-    InvalidInstruction(usize),
+    #[error("invalid BPF instruction")]
+    InvalidInstruction,
     /// Unsupported instruction
-    #[error("unsupported BPF instruction at {0}")]
-    UnsupportedInstruction(usize),
+    #[error("unsupported BPF instruction")]
+    UnsupportedInstruction,
     /// Compilation is too big to fit
     #[error("Compilation exhausted text segment at BPF instruction {0}")]
     ExhaustedTextSegment(usize),
@@ -86,4 +83,7 @@ pub enum EbpfError {
     /// Verifier error
     #[error("Verifier error: {0}")]
     VerifierError(#[from] VerifierError),
+    /// Syscall error
+    #[error("Syscall error: {0}")]
+    SyscallError(Box<dyn Error>),
 }

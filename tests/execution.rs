@@ -744,7 +744,7 @@ fn test_err_divide_by_zero() {
             executable,
             [],
             TestContextObject::new(2),
-            ProgramResult::Err(Box::new(EbpfError::DivideByZero(30))),
+            ProgramResult::Err(EbpfError::DivideByZero),
         );
     }
 }
@@ -786,7 +786,7 @@ fn test_err_divide_overflow() {
             executable,
             [],
             TestContextObject::new(4),
-            ProgramResult::Err(Box::new(EbpfError::DivideOverflow(32))),
+            ProgramResult::Err(EbpfError::DivideOverflow),
         );
     }
 }
@@ -891,13 +891,12 @@ fn test_err_ldxdw_oob() {
         ],
         (),
         TestContextObject::new(1),
-        ProgramResult::Err(Box::new(EbpfError::AccessViolation(
-            29,
+        ProgramResult::Err(EbpfError::AccessViolation(
             AccessType::Load,
             0x400000006,
             8,
             "input"
-        ))),
+        )),
     );
 }
 
@@ -910,13 +909,12 @@ fn test_err_ldxdw_nomem() {
         [],
         (),
         TestContextObject::new(1),
-        ProgramResult::Err(Box::new(EbpfError::AccessViolation(
-            29,
+        ProgramResult::Err(EbpfError::AccessViolation(
             AccessType::Load,
             0x400000006,
             8,
             "input"
-        ))),
+        )),
     );
 }
 
@@ -1345,7 +1343,7 @@ fn test_exit_capped() {
         [],
         (),
         TestContextObject::new(0),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(29))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
 }
 
@@ -1958,13 +1956,12 @@ fn test_err_dynamic_stack_out_of_bound() {
         [],
         (),
         TestContextObject::new(1),
-        ProgramResult::Err(Box::new(EbpfError::AccessViolation(
-            29,
+        ProgramResult::Err(EbpfError::AccessViolation(
             AccessType::Store,
             ebpf::MM_STACK_START - 1,
             1,
             "program"
-        ))),
+        )),
     );
 
     // Check that accessing MM_STACK_START + expected_stack_len fails
@@ -1976,13 +1973,12 @@ fn test_err_dynamic_stack_out_of_bound() {
         [],
         (),
         TestContextObject::new(1),
-        ProgramResult::Err(Box::new(EbpfError::AccessViolation(
-            29,
+        ProgramResult::Err(EbpfError::AccessViolation(
             AccessType::Store,
             ebpf::MM_STACK_START + config.stack_size() as u64,
             1,
             "stack"
-        ))),
+        )),
     );
 }
 
@@ -2010,13 +2006,12 @@ fn test_err_dynamic_stack_ptr_overflow() {
         [],
         (),
         TestContextObject::new(7),
-        ProgramResult::Err(Box::new(EbpfError::AccessViolation(
-            36,
+        ProgramResult::Err(EbpfError::AccessViolation(
             AccessType::Store,
             u64::MAX,
             1,
             "unknown"
-        ))),
+        )),
     );
 }
 
@@ -2158,10 +2153,7 @@ fn test_stack_call_depth_tracking() {
             [],
             (),
             TestContextObject::new(2),
-            ProgramResult::Err(Box::new(EbpfError::CallDepthExceeded(
-                31,
-                config.max_call_depth
-            ))),
+            ProgramResult::Err(EbpfError::CallDepthExceeded),
         );
     }
 }
@@ -2190,13 +2182,12 @@ fn test_err_mem_access_out_of_bound() {
             executable,
             mem,
             TestContextObject::new(3),
-            ProgramResult::Err(Box::new(EbpfError::AccessViolation(
-                31,
+            ProgramResult::Err(EbpfError::AccessViolation(
                 AccessType::Store,
                 address,
                 1,
                 "unknown"
-            ))),
+            )),
         );
     }
 }
@@ -2295,7 +2286,7 @@ fn test_err_callx_unregistered() {
         [],
         (),
         TestContextObject::new(6),
-        ProgramResult::Err(Box::new(EbpfError::UnsupportedInstruction(35))),
+        ProgramResult::Err(EbpfError::UnsupportedInstruction),
     );
 }
 
@@ -2309,7 +2300,7 @@ fn test_err_callx_oob_low() {
         [],
         (),
         TestContextObject::new(2),
-        ProgramResult::Err(Box::new(EbpfError::CallOutsideTextSegment(30, 0))),
+        ProgramResult::Err(EbpfError::CallOutsideTextSegment),
     );
 }
 
@@ -2325,10 +2316,7 @@ fn test_err_callx_oob_high() {
         [],
         (),
         TestContextObject::new(4),
-        ProgramResult::Err(Box::new(EbpfError::CallOutsideTextSegment(
-            32,
-            0xffffffff00000000
-        ))),
+        ProgramResult::Err(EbpfError::CallOutsideTextSegment),
     );
 }
 
@@ -2365,16 +2353,12 @@ fn test_bpf_to_bpf_depth() {
         [Config::default().max_call_depth as u8 + 1],
         (),
         TestContextObject::new(60),
-        ProgramResult::Err(Box::new(EbpfError::CallDepthExceeded(
-            35,
-            Config::default().max_call_depth
-        ))),
+        ProgramResult::Err(EbpfError::CallDepthExceeded),
     );
 }
 
 #[test]
 fn test_err_reg_stack_depth() {
-    let config = Config::default();
     test_interpreter_and_jit_asm!(
         "
         mov64 r0, 0x1
@@ -2384,10 +2368,7 @@ fn test_err_reg_stack_depth() {
         [],
         (),
         TestContextObject::new(60),
-        ProgramResult::Err(Box::new(EbpfError::CallDepthExceeded(
-            31,
-            config.max_call_depth
-        ))),
+        ProgramResult::Err(EbpfError::CallDepthExceeded),
     );
 }
 
@@ -2431,7 +2412,7 @@ fn test_err_syscall_string() {
             "bpf_syscall_string" => syscalls::bpf_syscall_string,
         ),
         TestContextObject::new(2),
-        ProgramResult::Err(Box::new(EbpfError::AccessViolation(0, AccessType::Load, 0, 0, "unknown"))),
+        ProgramResult::Err(EbpfError::AccessViolation(AccessType::Load, 0, 0, "unknown")),
     );
 }
 
@@ -2529,7 +2510,7 @@ fn nested_vm_syscall(
     *result = if throw == 0 {
         ProgramResult::Ok(42)
     } else {
-        ProgramResult::Err(Box::new(EbpfError::CallDepthExceeded(33, 0)))
+        ProgramResult::Err(EbpfError::CallDepthExceeded)
     };
     #[allow(unused_mut)]
     if depth > 0 {
@@ -2586,7 +2567,7 @@ fn test_nested_vm_syscall() {
         &mut memory_mapping,
         &mut result,
     );
-    assert_error!(result, "CallDepthExceeded(33, 0)");
+    assert_error!(result, "CallDepthExceeded");
 }
 
 // Instruction Meter Limit
@@ -2600,7 +2581,7 @@ fn test_tight_infinite_loop_conditional() {
         [],
         (),
         TestContextObject::new(4),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(30))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
 }
 
@@ -2613,7 +2594,7 @@ fn test_tight_infinite_loop_unconditional() {
         [],
         (),
         TestContextObject::new(4),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(30))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
 }
 
@@ -2628,7 +2609,7 @@ fn test_tight_infinite_recursion() {
         [],
         (),
         TestContextObject::new(4),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(31))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
 }
 
@@ -2648,7 +2629,7 @@ fn test_tight_infinite_recursion_callx() {
         [],
         (),
         TestContextObject::new(8),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(36))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
 }
 
@@ -2682,7 +2663,7 @@ fn test_err_instruction_count_syscall_capped() {
             "bpf_syscall_string" => syscalls::bpf_syscall_string,
         ),
         TestContextObject::new(3),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(32))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
 }
 
@@ -2703,7 +2684,7 @@ fn test_non_terminate_early() {
         [],
         (),
         TestContextObject::new(7),
-        ProgramResult::Err(Box::new(EbpfError::UnsupportedInstruction(35))),
+        ProgramResult::Err(EbpfError::UnsupportedInstruction),
     );
 }
 
@@ -2726,7 +2707,7 @@ fn test_err_non_terminate_capped() {
             "bpf_trace_printf" => syscalls::bpf_trace_printf,
         ),
         TestContextObject::new(7),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(36))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
     test_interpreter_and_jit_asm!(
         "
@@ -2745,7 +2726,7 @@ fn test_err_non_terminate_capped() {
             "bpf_trace_printf" => syscalls::bpf_trace_printf,
         ),
         TestContextObject::new(1000),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(37))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
 }
 
@@ -2763,7 +2744,7 @@ fn test_err_capped_before_exception() {
         [],
         (),
         TestContextObject::new(4),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(33))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
     test_interpreter_and_jit_asm!(
         "
@@ -2777,7 +2758,7 @@ fn test_err_capped_before_exception() {
         [],
         (),
         TestContextObject::new(4),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(33))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
 }
 
@@ -2796,7 +2777,7 @@ fn test_err_exit_capped() {
         [],
         (),
         TestContextObject::new(5),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(35))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
     test_interpreter_and_jit_asm!(
         "
@@ -2812,7 +2793,7 @@ fn test_err_exit_capped() {
         [],
         (),
         TestContextObject::new(6),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(36))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
     test_interpreter_and_jit_asm!(
         "
@@ -2824,7 +2805,7 @@ fn test_err_exit_capped() {
         [],
         (),
         TestContextObject::new(3),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(33))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
 }
 
@@ -2864,7 +2845,7 @@ fn test_err_call_unresolved() {
         [],
         (),
         TestContextObject::new(6),
-        ProgramResult::Err(Box::new(EbpfError::UnsupportedInstruction(34))),
+        ProgramResult::Err(EbpfError::UnsupportedInstruction),
     );
 }
 
@@ -2919,7 +2900,7 @@ fn test_err_unresolved_syscall_static() {
         [],
         (),
         TestContextObject::new(4),
-        ProgramResult::Err(Box::new(EbpfError::UnsupportedInstruction(32))),
+        ProgramResult::Err(EbpfError::UnsupportedInstruction),
     );
 }
 
@@ -3425,13 +3406,12 @@ fn test_err_fixed_stack_out_of_bound() {
         [],
         (),
         TestContextObject::new(1),
-        ProgramResult::Err(Box::new(EbpfError::AccessViolation(
-            29,
+        ProgramResult::Err(EbpfError::AccessViolation(
             AccessType::Store,
             0x1FFFFD000,
             1,
             "program"
-        ))),
+        )),
     );
 }
 
@@ -3492,7 +3472,7 @@ fn test_lddw() {
         [],
         (),
         TestContextObject::new(4),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(33))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
     test_interpreter_and_jit_asm!(
         "
@@ -3506,7 +3486,7 @@ fn test_lddw() {
         [],
         (),
         TestContextObject::new(5),
-        ProgramResult::Err(Box::new(EbpfError::UnsupportedInstruction(34))),
+        ProgramResult::Err(EbpfError::UnsupportedInstruction),
     );
     test_interpreter_and_jit_asm!(
         "
@@ -3523,7 +3503,7 @@ fn test_lddw() {
         [],
         (),
         TestContextObject::new(5),
-        ProgramResult::Err(Box::new(EbpfError::UnsupportedInstruction(36))),
+        ProgramResult::Err(EbpfError::UnsupportedInstruction),
     );
     test_interpreter_and_jit_asm!(
         "
@@ -3539,7 +3519,7 @@ fn test_lddw() {
         [],
         (),
         TestContextObject::new(3),
-        ProgramResult::Err(Box::new(EbpfError::UnsupportedInstruction(36))),
+        ProgramResult::Err(EbpfError::UnsupportedInstruction),
     );
     test_interpreter_and_jit_asm!(
         "
@@ -3552,7 +3532,7 @@ fn test_lddw() {
         [],
         (),
         TestContextObject::new(2),
-        ProgramResult::Err(Box::new(EbpfError::ExceededMaxInstructions(32))),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
 }
 
@@ -3849,7 +3829,7 @@ fn test_div() {
         [],
         (),
         TestContextObject::new(3),
-        ProgramResult::Err(Box::new(EbpfError::DivideByZero(31))),
+        ProgramResult::Err(EbpfError::DivideByZero),
     );
     test_interpreter_and_jit_asm!(
         "
@@ -3861,7 +3841,7 @@ fn test_div() {
         [],
         (),
         TestContextObject::new(3),
-        ProgramResult::Err(Box::new(EbpfError::DivideByZero(31))),
+        ProgramResult::Err(EbpfError::DivideByZero),
     );
 }
 
@@ -3922,7 +3902,7 @@ fn test_mod() {
         [],
         (),
         TestContextObject::new(3),
-        ProgramResult::Err(Box::new(EbpfError::DivideByZero(31))),
+        ProgramResult::Err(EbpfError::DivideByZero),
     );
     test_interpreter_and_jit_asm!(
         "
@@ -3934,6 +3914,6 @@ fn test_mod() {
         [],
         (),
         TestContextObject::new(3),
-        ProgramResult::Err(Box::new(EbpfError::DivideByZero(31))),
+        ProgramResult::Err(EbpfError::DivideByZero),
     );
 }
