@@ -110,8 +110,7 @@ impl JitProgram {
                 "push rbp",
                 "mov [{host_stack_pointer}], rsp",
                 "add QWORD PTR [{host_stack_pointer}], -8", // We will push RIP in "call r10" later
-                "mov rbp, {rbp}",
-                "mov rbx, {rbx}",
+                "mov rbx, rax",
                 "mov rax, [r11 + 0x00]",
                 "mov rsi, [r11 + 0x08]",
                 "mov rdx, [r11 + 0x10]",
@@ -122,17 +121,18 @@ impl JitProgram {
                 "mov r13, [r11 + 0x38]",
                 "mov r14, [r11 + 0x40]",
                 "mov r15, [r11 + 0x48]",
+                "mov rbp, [r11 + 0x50]",
                 "mov r11, [r11 + 0x58]",
                 "call r10",
+                "mov rax, rbx",
                 "pop rbp",
                 "pop rbx",
                 host_stack_pointer = in(reg) &mut vm.host_stack_pointer,
-                rbp = in(reg) (vm as *mut _ as *mut u64).offset(*RUNTIME_ENVIRONMENT_KEY.get().unwrap() as isize),
-                rbx = in(reg) registers[ebpf::FRAME_PTR_REG],
-                inlateout("rdi") instruction_meter,
+                inlateout("rax") instruction_meter,
+                inlateout("rdi") (vm as *mut _ as *mut u64).offset(*RUNTIME_ENVIRONMENT_KEY.get().unwrap() as isize) => _,
                 inlateout("r10") self.pc_section[registers[11] as usize] => _,
                 inlateout("r11") &registers => _,
-                lateout("rax") _, lateout("rsi") _, lateout("rdx") _, lateout("rcx") _, lateout("r8") _,
+                lateout("rsi") _, lateout("rdx") _, lateout("rcx") _, lateout("r8") _,
                 lateout("r9") _, lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
                 // lateout("rbp") _, lateout("rbx") _,
             );
@@ -208,13 +208,13 @@ const REGISTER_MAP: [u8; 11] = [
     CALLEE_SAVED_REGISTERS[3], // R13
     CALLEE_SAVED_REGISTERS[4], // R14
     CALLEE_SAVED_REGISTERS[5], // R15
-    CALLEE_SAVED_REGISTERS[1], // RBX
+    CALLEE_SAVED_REGISTERS[0], // RBP
 ];
 
-/// RDI: Program counter limit
-const REGISTER_INSTRUCTION_METER: u8 = ARGUMENT_REGISTERS[0];
-/// RBP: Used together with slot_in_vm()
-const REGISTER_PTR_TO_VM: u8 = CALLEE_SAVED_REGISTERS[0];
+/// RDI: Used together with slot_in_vm()
+const REGISTER_PTR_TO_VM: u8 = ARGUMENT_REGISTERS[0];
+/// RBX: Program counter limit
+const REGISTER_INSTRUCTION_METER: u8 = CALLEE_SAVED_REGISTERS[1];
 /// R10: Other scratch register
 const REGISTER_OTHER_SCRATCH: u8 = CALLER_SAVED_REGISTERS[7];
 /// R11: Scratch register
@@ -910,12 +910,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
     }
 
-    fn emit_rust_call(&mut self, dst: Value, arguments: &[Argument], result_reg: Option<u8>) {
+    fn emit_rust_call(&mut self, target: Value, arguments: &[Argument], result_reg: Option<u8>) {
         let mut saved_registers = CALLER_SAVED_REGISTERS.to_vec();
         if let Some(reg) = result_reg {
-            let dst = saved_registers.iter().position(|x| *x == reg);
-            debug_assert!(dst.is_some());
-            if let Some(dst) = dst {
+            if let Some(dst) = saved_registers.iter().position(|x| *x == reg) {
                 saved_registers.remove(dst);
             }
         }
@@ -941,7 +939,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         for argument in arguments {
             let is_stack_argument = argument.index >= ARGUMENT_REGISTERS.len();
             let dst = if is_stack_argument {
-                REGISTER_SCRATCH
+                u8::MAX // Never used
             } else {
                 ARGUMENT_REGISTERS[argument.index]
             };
@@ -987,7 +985,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             }
         }
     
-        match dst {
+        match target {
             Value::Register(reg) => {
                 self.emit_ins(X86Instruction::call_reg(reg, None));
             },
