@@ -16,7 +16,7 @@ use crate::{
     ebpf::{self, STACK_PTR_REG},
     elf::Executable,
     error::EbpfError,
-    vm::{Config, ContextObject, EbpfVm, ProgramResult},
+    vm::{get_runtime_environment_key, Config, ContextObject, EbpfVm, ProgramResult},
 };
 
 /// Virtual memory operation helper.
@@ -91,7 +91,6 @@ pub struct Interpreter<'a, 'b, C: ContextObject> {
     pub(crate) executable: &'a Executable<C>,
     pub(crate) program: &'a [u8],
     pub(crate) program_vm_addr: u64,
-    pub(crate) due_insn_count: u64,
 
     /// General purpose registers and pc
     pub reg: [u64; 12],
@@ -115,7 +114,6 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             executable,
             program,
             program_vm_addr,
-            due_insn_count: 0,
             reg: registers,
             #[cfg(feature = "debugger")]
             debug_state: DebugState::Continue,
@@ -161,7 +159,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
     pub fn step(&mut self) -> bool {
         let config = &self.executable.get_config();
 
-        self.due_insn_count += 1;
+        self.vm.due_insn_count += 1;
         let mut next_pc = self.reg[11] + 1;
         if next_pc as usize * ebpf::INSN_SIZE > self.program.len() {
             throw_error!(self, EbpfError::ExecutionOverrun);
@@ -456,7 +454,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                 }
                 check_pc!(self, next_pc, (target_pc - self.program_vm_addr) / ebpf::INSN_SIZE as u64);
                 if self.executable.get_sbpf_version().static_syscalls() && self.executable.get_function_registry().lookup_by_key(next_pc as u32).is_none() {
-                    self.due_insn_count += 1;
+                    self.vm.due_insn_count += 1;
                     self.reg[11] = next_pc;
                     throw_error!(self, EbpfError::UnsupportedInstruction);
                 }
@@ -476,27 +474,20 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                     if let Some((_function_name, function)) = self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
                         resolved = true;
 
-                        if config.enable_instruction_meter {
-                            self.vm.context_object_pointer.consume(self.due_insn_count);
-                        }
-                        self.due_insn_count = 0;
+                        self.vm.due_insn_count = self.vm.previous_instruction_meter - self.vm.due_insn_count;
                         function(
-                            self.vm.context_object_pointer,
+                            unsafe { (self.vm as *mut _ as *mut u64).offset(get_runtime_environment_key() as isize) as *mut _ },
                             self.reg[1],
                             self.reg[2],
                             self.reg[3],
                             self.reg[4],
                             self.reg[5],
-                            &mut self.vm.memory_mapping,
-                            &mut self.vm.program_result,
                         );
+                        self.vm.due_insn_count = 0;
                         self.reg[0] = match &self.vm.program_result {
                             ProgramResult::Ok(value) => *value,
                             ProgramResult::Err(_err) => return false,
                         };
-                        if config.enable_instruction_meter {
-                            self.vm.previous_instruction_meter = self.vm.context_object_pointer.get_remaining();
-                        }
                     }
                 }
 
@@ -519,7 +510,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
 
             ebpf::EXIT       => {
                 if self.vm.call_depth == 0 {
-                    if config.enable_instruction_meter && self.due_insn_count > self.vm.previous_instruction_meter {
+                    if config.enable_instruction_meter && self.vm.due_insn_count > self.vm.previous_instruction_meter {
                         throw_error!(self, EbpfError::ExceededMaxInstructions);
                     }
                     self.vm.program_result = ProgramResult::Ok(self.reg[0]);
@@ -542,7 +533,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             _ => throw_error!(self, EbpfError::UnsupportedInstruction),
         }
 
-        if config.enable_instruction_meter && self.due_insn_count >= self.vm.previous_instruction_meter {
+        if config.enable_instruction_meter && self.vm.due_insn_count >= self.vm.previous_instruction_meter {
             self.reg[11] += 1;
             throw_error!(self, EbpfError::ExceededMaxInstructions);
         }

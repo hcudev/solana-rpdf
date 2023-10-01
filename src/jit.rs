@@ -21,19 +21,13 @@ use crate::{
         allocate_pages, free_pages, get_system_page_size, protect_pages, round_to_page_size,
     },
     memory_region::{AccessType, MemoryMapping},
-    vm::{Config, ContextObject, EbpfVm, ProgramResult},
+    vm::{get_runtime_environment_key, Config, ContextObject, EbpfVm, ProgramResult},
     x86::*,
 };
 
-/// Shift the RUNTIME_ENVIRONMENT_KEY by this many bits to the LSB
-///
-/// 3 bits for 8 Byte alignment, and 1 bit to have encoding space for the RuntimeEnvironment.
-const PROGRAM_ENVIRONMENT_KEY_SHIFT: u32 = 4;
 const MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH: usize = 4096;
 const MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION: usize = 110;
 const MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT: usize = 13;
-
-static RUNTIME_ENVIRONMENT_KEY: std::sync::OnceLock<i32> = std::sync::OnceLock::<i32>::new();
 
 pub struct JitProgram {
     /// OS page size in bytes and the alignment of the sections
@@ -100,10 +94,8 @@ impl JitProgram {
         _config: &Config,
         vm: &mut EbpfVm<C>,
         registers: [u64; 12],
-    ) -> i64 {
+    ) {
         unsafe {
-            let mut instruction_meter =
-                (vm.previous_instruction_meter as i64).wrapping_add(registers[11] as i64);
             std::arch::asm!(
                 // RBP and RBX must be saved and restored manually in the current version of rustc and llvm.
                 "push rbx",
@@ -124,19 +116,17 @@ impl JitProgram {
                 "mov rbp, [r11 + 0x50]",
                 "mov r11, [r11 + 0x58]",
                 "call r10",
-                "mov rax, rbx",
                 "pop rbp",
                 "pop rbx",
                 host_stack_pointer = in(reg) &mut vm.host_stack_pointer,
-                inlateout("rax") instruction_meter,
-                inlateout("rdi") (vm as *mut _ as *mut u64).offset(*RUNTIME_ENVIRONMENT_KEY.get().unwrap() as isize) => _,
+                inlateout("rdi") (vm as *mut _ as *mut u64).offset(get_runtime_environment_key() as isize) => _,
+                inlateout("rax") (vm.previous_instruction_meter as i64).wrapping_add(registers[11] as i64) => _,
                 inlateout("r10") self.pc_section[registers[11] as usize] => _,
                 inlateout("r11") &registers => _,
                 lateout("rsi") _, lateout("rdx") _, lateout("rcx") _, lateout("r8") _,
                 lateout("r9") _, lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
                 // lateout("rbp") _, lateout("rbx") _,
             );
-            instruction_meter
         }
     }
 
@@ -255,11 +245,12 @@ enum RuntimeEnvironmentSlot {
     StackPointer = 2,
     ContextObjectPointer = 3,
     PreviousInstructionMeter = 4,
-    StopwatchNumerator = 5,
-    StopwatchDenominator = 6,
-    Registers = 7,
-    ProgramResult = 19,
-    MemoryMapping = 27,
+    DueInsnCount = 5,
+    StopwatchNumerator = 6,
+    StopwatchDenominator = 7,
+    Registers = 8,
+    ProgramResult = 20,
+    MemoryMapping = 28,
 }
 
 /* Explaination of the Instruction Meter
@@ -357,13 +348,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             code_length_estimate += pc / config.instruction_meter_checkpoint_distance * MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT;
         }
 
-        let runtime_environment_key = *RUNTIME_ENVIRONMENT_KEY.get_or_init(|| {
-            if config.encrypt_runtime_environment {
-                rand::thread_rng().gen::<i32>() >> PROGRAM_ENVIRONMENT_KEY_SHIFT
-            } else {
-                0
-            }
-        });
+        let runtime_environment_key = get_runtime_environment_key();
         let mut diversification_rng = SmallRng::from_rng(rand::thread_rng()).map_err(|_| EbpfError::JitNotCompiled)?;
         
         Ok(Self {
@@ -1326,6 +1311,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         if self.config.enable_instruction_meter {
             self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 5, REGISTER_INSTRUCTION_METER, 1, None)); // REGISTER_INSTRUCTION_METER -= 1;
             self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, REGISTER_SCRATCH, REGISTER_INSTRUCTION_METER, 0, None)); // REGISTER_INSTRUCTION_METER -= pc;
+            // *DueInsnCount = *PreviousInstructionMeter - REGISTER_INSTRUCTION_METER;
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x2B, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, 0, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::PreviousInstructionMeter))))); // REGISTER_INSTRUCTION_METER -= *PreviousInstructionMeter;
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0xf7, 3, REGISTER_INSTRUCTION_METER, 0, None)); // REGISTER_INSTRUCTION_METER = -REGISTER_INSTRUCTION_METER;
+            self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::DueInsnCount)))); // *DueInsnCount = REGISTER_INSTRUCTION_METER;
         }
         // Print stop watch value
         fn stopwatch_result(numerator: u64, denominator: u64) {
@@ -1398,29 +1387,18 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.set_anchor(ANCHOR_EXTERNAL_FUNCTION_CALL);
         self.emit_ins(X86Instruction::push_immediate(OperandSize::S64, -1)); // Used as PC value in error case, acts as stack padding otherwise
         if self.config.enable_instruction_meter {
-            // REGISTER_INSTRUCTION_METER = *PreviousInstructionMeter - REGISTER_INSTRUCTION_METER;
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x2B, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, 0, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::PreviousInstructionMeter))))); // REGISTER_INSTRUCTION_METER -= *PreviousInstructionMeter;
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0xf7, 3, REGISTER_INSTRUCTION_METER, 0, None)); // REGISTER_INSTRUCTION_METER = -REGISTER_INSTRUCTION_METER;
-            self.emit_rust_call(Value::Constant64(C::consume as *const u8 as i64, false), &[
-                Argument { index: 1, value: Value::Register(REGISTER_INSTRUCTION_METER) },
-                Argument { index: 0, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::ContextObjectPointer), false) },
-            ], None);
+            self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::DueInsnCount)))); // *DueInsnCount = REGISTER_INSTRUCTION_METER;
         }
         self.emit_rust_call(Value::Register(REGISTER_SCRATCH), &[
-            Argument { index: 7, value: Value::RegisterPlusConstant32(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult), false) },
-            Argument { index: 6, value: Value::RegisterPlusConstant32(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping), false) },
             Argument { index: 5, value: Value::Register(ARGUMENT_REGISTERS[5]) },
             Argument { index: 4, value: Value::Register(ARGUMENT_REGISTERS[4]) },
             Argument { index: 3, value: Value::Register(ARGUMENT_REGISTERS[3]) },
             Argument { index: 2, value: Value::Register(ARGUMENT_REGISTERS[2]) },
             Argument { index: 1, value: Value::Register(ARGUMENT_REGISTERS[1]) },
-            Argument { index: 0, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::ContextObjectPointer), false) },
+            Argument { index: 0, value: Value::Register(REGISTER_PTR_TO_VM) },
         ], None);
         if self.config.enable_instruction_meter {
-            self.emit_rust_call(Value::Constant64(C::get_remaining as *const u8 as i64, false), &[
-                Argument { index: 0, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::ContextObjectPointer), false) },
-            ], Some(REGISTER_INSTRUCTION_METER));
-            self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::PreviousInstructionMeter)))); // *PreviousInstructionMeter = REGISTER_INSTRUCTION_METER;
+            self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_PTR_TO_VM, REGISTER_INSTRUCTION_METER, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::PreviousInstructionMeter)))); // REGISTER_INSTRUCTION_METER = *PreviousInstructionMeter;
         }
 
         // Test if result indicates that an error occured
@@ -1650,6 +1628,7 @@ mod tests {
         check_slot!(env, stack_pointer, StackPointer);
         check_slot!(env, context_object_pointer, ContextObjectPointer);
         check_slot!(env, previous_instruction_meter, PreviousInstructionMeter);
+        check_slot!(env, due_insn_count, DueInsnCount);
         check_slot!(env, stopwatch_numerator, StopwatchNumerator);
         check_slot!(env, stopwatch_denominator, StopwatchDenominator);
         check_slot!(env, registers, Registers);
