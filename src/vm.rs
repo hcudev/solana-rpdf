@@ -15,7 +15,7 @@
 use crate::{
     ebpf,
     elf::Executable,
-    error::EbpfError,
+    error::{EbpfError, ProgramResult},
     interpreter::Interpreter,
     memory_region::MemoryMapping,
     program::{BuiltinProgram, FunctionRegistry, SBPFVersion},
@@ -35,83 +35,6 @@ pub fn get_runtime_environment_key() -> i32 {
     *RUNTIME_ENVIRONMENT_KEY
         .get_or_init(|| rand::thread_rng().gen::<i32>() >> PROGRAM_ENVIRONMENT_KEY_SHIFT)
 }
-
-/// Same as `Result` but provides a stable memory layout
-#[derive(Debug)]
-#[repr(C, u64)]
-pub enum StableResult<T, E> {
-    /// Success
-    Ok(T),
-    /// Failure
-    Err(E),
-}
-
-impl<T: Debug, E: Debug> StableResult<T, E> {
-    /// `true` if `Ok`
-    pub fn is_ok(&self) -> bool {
-        match self {
-            Self::Ok(_) => true,
-            Self::Err(_) => false,
-        }
-    }
-
-    /// `true` if `Err`
-    pub fn is_err(&self) -> bool {
-        match self {
-            Self::Ok(_) => false,
-            Self::Err(_) => true,
-        }
-    }
-
-    /// Returns the inner value if `Ok`, panics otherwise
-    pub fn unwrap(self) -> T {
-        match self {
-            Self::Ok(value) => value,
-            Self::Err(error) => panic!("unwrap {:?}", error),
-        }
-    }
-
-    /// Returns the inner error if `Err`, panics otherwise
-    pub fn unwrap_err(self) -> E {
-        match self {
-            Self::Ok(value) => panic!("unwrap_err {:?}", value),
-            Self::Err(error) => error,
-        }
-    }
-
-    #[cfg_attr(
-        any(
-            not(feature = "jit"),
-            target_os = "windows",
-            not(target_arch = "x86_64")
-        ),
-        allow(dead_code)
-    )]
-    pub(crate) fn discriminant(&self) -> u64 {
-        unsafe { *(self as *const _ as *const u64) }
-    }
-}
-
-impl<T, E> From<StableResult<T, E>> for Result<T, E> {
-    fn from(result: StableResult<T, E>) -> Self {
-        match result {
-            StableResult::Ok(value) => Ok(value),
-            StableResult::Err(value) => Err(value),
-        }
-    }
-}
-
-impl<T, E> From<Result<T, E>> for StableResult<T, E> {
-    fn from(result: Result<T, E>) -> Self {
-        match result {
-            Ok(value) => Self::Ok(value),
-            Err(value) => Self::Err(value),
-        }
-    }
-}
-
-/// Return value of programs and syscalls
-pub type ProgramResult = StableResult<u64, EbpfError>;
 
 /// VM configuration settings
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,49 +420,5 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
         let mut result = ProgramResult::Ok(0);
         std::mem::swap(&mut result, &mut self.program_result);
         (instruction_count, result)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{program::BuiltinFunction, syscalls};
-
-    #[test]
-    fn test_program_result_is_stable() {
-        let ok = ProgramResult::Ok(42);
-        assert_eq!(ok.discriminant(), 0);
-        let err = ProgramResult::Err(EbpfError::JitNotCompiled);
-        assert_eq!(err.discriminant(), 1);
-    }
-
-    #[test]
-    fn test_builtin_program_eq() {
-        let mut function_registry_a =
-            FunctionRegistry::<BuiltinFunction<TestContextObject>>::default();
-        function_registry_a
-            .register_function_hashed(*b"log", syscalls::SyscallString::vm)
-            .unwrap();
-        function_registry_a
-            .register_function_hashed(*b"log_64", syscalls::SyscallU64::vm)
-            .unwrap();
-        let mut function_registry_b =
-            FunctionRegistry::<BuiltinFunction<TestContextObject>>::default();
-        function_registry_b
-            .register_function_hashed(*b"log_64", syscalls::SyscallU64::vm)
-            .unwrap();
-        function_registry_b
-            .register_function_hashed(*b"log", syscalls::SyscallString::vm)
-            .unwrap();
-        let mut function_registry_c =
-            FunctionRegistry::<BuiltinFunction<TestContextObject>>::default();
-        function_registry_c
-            .register_function_hashed(*b"log_64", syscalls::SyscallU64::vm)
-            .unwrap();
-        let builtin_program_a = BuiltinProgram::new_loader(Config::default(), function_registry_a);
-        let builtin_program_b = BuiltinProgram::new_loader(Config::default(), function_registry_b);
-        assert_eq!(builtin_program_a, builtin_program_b);
-        let builtin_program_c = BuiltinProgram::new_loader(Config::default(), function_registry_c);
-        assert_ne!(builtin_program_a, builtin_program_c);
     }
 }

@@ -296,7 +296,7 @@ macro_rules! declare_builtin_function {
         $arg_d:ident : u64,
         $arg_e:ident : u64,
         $memory_mapping:ident : &mut $MemoryMapping:ty,
-    ) -> Result<u64, EbpfError> $rust:tt) => {
+    ) -> Result<u64, Box<dyn std::error::Error>> $rust:tt) => {
         $(#[$attr])*
         pub struct $name {}
         impl $name {
@@ -309,7 +309,7 @@ macro_rules! declare_builtin_function {
                 $arg_d: u64,
                 $arg_e: u64,
                 $memory_mapping: &mut $MemoryMapping,
-            ) -> Result<u64, EbpfError> {
+            ) -> Result<u64, Box<dyn std::error::Error>> {
                 $rust
             }
             /// VM interface
@@ -330,9 +330,9 @@ macro_rules! declare_builtin_function {
                 if config.enable_instruction_meter {
                     vm.context_object_pointer.consume(vm.previous_instruction_meter - vm.due_insn_count);
                 }
-                let converted_result: $crate::vm::ProgramResult = Self::rust(
+                let converted_result: $crate::error::ProgramResult = Self::rust(
                     vm.context_object_pointer, $arg_a, $arg_b, $arg_c, $arg_d, $arg_e, &mut vm.memory_mapping,
-                ).into();
+                ).map_err(|err| $crate::error::EbpfError::SyscallError(err)).into();
                 vm.program_result = converted_result;
                 if config.enable_instruction_meter {
                     vm.previous_instruction_meter = vm.context_object_pointer.get_remaining();
@@ -340,4 +340,40 @@ macro_rules! declare_builtin_function {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{program::BuiltinFunction, syscalls, vm::TestContextObject};
+
+    #[test]
+    fn test_builtin_program_eq() {
+        let mut function_registry_a =
+            FunctionRegistry::<BuiltinFunction<TestContextObject>>::default();
+        function_registry_a
+            .register_function_hashed(*b"log", syscalls::SyscallString::vm)
+            .unwrap();
+        function_registry_a
+            .register_function_hashed(*b"log_64", syscalls::SyscallU64::vm)
+            .unwrap();
+        let mut function_registry_b =
+            FunctionRegistry::<BuiltinFunction<TestContextObject>>::default();
+        function_registry_b
+            .register_function_hashed(*b"log_64", syscalls::SyscallU64::vm)
+            .unwrap();
+        function_registry_b
+            .register_function_hashed(*b"log", syscalls::SyscallString::vm)
+            .unwrap();
+        let mut function_registry_c =
+            FunctionRegistry::<BuiltinFunction<TestContextObject>>::default();
+        function_registry_c
+            .register_function_hashed(*b"log_64", syscalls::SyscallU64::vm)
+            .unwrap();
+        let builtin_program_a = BuiltinProgram::new_loader(Config::default(), function_registry_a);
+        let builtin_program_b = BuiltinProgram::new_loader(Config::default(), function_registry_b);
+        assert_eq!(builtin_program_a, builtin_program_b);
+        let builtin_program_c = BuiltinProgram::new_loader(Config::default(), function_registry_c);
+        assert_ne!(builtin_program_a, builtin_program_c);
+    }
 }
