@@ -167,7 +167,7 @@ impl<T: Copy + PartialEq> FunctionRegistry<T> {
 
     /// Iterate over all keys
     pub fn keys(&self) -> impl Iterator<Item = u32> + '_ {
-        self.map.keys().cloned()
+        self.map.keys().copied()
     }
 
     /// Iterate over all entries
@@ -324,7 +324,7 @@ macro_rules! declare_builtin_function {
             ) {
                 use $crate::vm::ContextObject;
                 let vm = unsafe {
-                    &mut *(($vm as *mut u64).offset(-($crate::vm::get_runtime_environment_key() as isize)) as *mut $crate::vm::EbpfVm<$ContextObject>)
+                    &mut *($vm.cast::<u64>().offset(-($crate::vm::get_runtime_environment_key() as isize)).cast::<$crate::vm::EbpfVm<$ContextObject>>())
                 };
                 let config = vm.loader.get_config();
                 if config.enable_instruction_meter {
