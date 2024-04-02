@@ -347,6 +347,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         if config.instruction_meter_checkpoint_distance != 0 {
             code_length_estimate += pc / config.instruction_meter_checkpoint_distance * MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT;
         }
+        // Relative jump destinations limit the maximum output size
+        debug_assert!(code_length_estimate < (i32::MAX as usize));
 
         let runtime_environment_key = get_runtime_environment_key();
         let mut diversification_rng = SmallRng::from_rng(rand::thread_rng()).map_err(|_| EbpfError::JitNotCompiled)?;
@@ -372,6 +374,14 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     /// Compiles the given executable, consuming the compiler
     pub fn compile(mut self) -> Result<JitProgram, EbpfError> {
         let text_section_base = self.result.text_section.as_ptr();
+
+        // Randomized padding at the start before random intervals begin
+        if self.config.noop_instruction_rate != 0 {
+            for _ in 0..self.diversification_rng.gen_range(0..self.config.noop_instruction_rate) {
+                // X86Instruction::noop().emit(self)?;
+                self.emit::<u8>(0x90);
+            }
+        }
 
         self.emit_subroutines();
 
@@ -654,7 +664,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
                     if internal {
                         if let Some((_function_name, target_pc)) = self.executable.get_function_registry().lookup_by_key(insn.imm as u32) {
-                            self.emit_internal_call(Value::Constant64(target_pc as i64, false));
+                            self.emit_internal_call(Value::Constant64(target_pc as i64, true));
                             resolved = true;
                         }
                     }
@@ -1023,9 +1033,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_ins(X86Instruction::call_reg(REGISTER_OTHER_SCRATCH, None)); // callq *REGISTER_OTHER_SCRATCH
             },
             Value::Constant64(target_pc, user_provided) => {
-                debug_assert!(!user_provided);
+                debug_assert!(user_provided);
                 self.emit_validate_and_profile_instruction_count(false, Some(target_pc as usize));
-                self.emit_ins(X86Instruction::load_immediate(OperandSize::S64, REGISTER_SCRATCH, target_pc));
+                if user_provided && self.should_sanitize_constant(target_pc) {
+                    self.emit_sanitized_load_immediate(OperandSize::S64, REGISTER_SCRATCH, target_pc);
+                } else {
+                    self.emit_ins(X86Instruction::load_immediate(OperandSize::S64, REGISTER_SCRATCH, target_pc));
+                }
                 let jump_offset = self.relative_to_target_pc(target_pc as usize, 5);
                 self.emit_ins(X86Instruction::call_immediate(jump_offset));
             },
